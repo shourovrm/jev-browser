@@ -19,6 +19,7 @@ export interface RawElement {
   submitControl?: boolean; // button[type=submit], input[type=submit], or a type-less <button> inside a form
   enterSubmittable?: boolean; // single-line text field: Enter submits its form (or runs the site's handler)
   options?: SelectOption[]; // options for selects, with their DOM index
+  menu?: "open" | "closed"; // a menu toggle (aria-expanded / aria-haspopup) and its current state
 }
 
 /** One native <select> option: its DOM index and (scrubbed) label. */
@@ -35,6 +36,7 @@ export interface PageElement {
   description: string;
   submitVia?: "click" | "enter"; // for kind === "submit": click the control, or press Enter on the field
   options?: SelectOption[]; // for kind === "select": the native option labels
+  menu?: "open" | "closed"; // for kind === "click": a menu toggle, opened by openMenu() when closed
 }
 
 const JUNK_NAMES = new Set([
@@ -66,6 +68,13 @@ export interface BuildActionSpaceOptions {
 }
 
 /** Filter, dedupe by destination, cap, and describe the action space for one step. */
+/** Tells Jev that a control is a menu, so clicking it is a way to reveal more options. */
+function menuNote(menu: RawElement["menu"]): string {
+  if (menu === "closed") return " (menu, closed; clicking shows its items)";
+  if (menu === "open") return " (menu, open)";
+  return "";
+}
+
 export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOptions = {}): { elements: PageElement[]; truncated: boolean } {
   const passwordActive = opts.passwordActive === true;
   const seenHrefs = new Set<string>();
@@ -128,8 +137,9 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
               ? `${el.tag} "${label}" (type without submitting)`
               : kind === "select"
                 ? `${el.tag} "${label}" (dropdown; a follow-up picks the option)`
-                : `${el.tag} "${label}"${hrefTail}`,
+                : `${el.tag} "${label}"${hrefTail}${menuNote(el.menu)}`,
       options: kind === "select" ? (el.options ?? []) : undefined,
+      menu: kind === "click" ? el.menu : undefined,
     });
     // Non-search single-line text fields additionally offer submit (press
     // Enter), which keeps Enter-driven flows reachable as two explicit steps:
@@ -251,7 +261,7 @@ export interface TypingCandidateSpec {
 /** Named typing providers in auto-detection order. */
 export const TYPING_CANDIDATES: TypingCandidateSpec[] = [
   { provider: "openai", keyEnv: ["OPENAI_API_KEY"], keyLabel: "an sk- key", keyPattern: /^sk-/, defaultModel: "gpt-5.6-luna" },
-  { provider: "openrouter", keyEnv: ["OPENROUTER_API_KEY"], keyLabel: "an sk-or- key", keyPattern: /^sk-or-/, defaultModel: "google/gemini-2.5-flash-lite" },
+  { provider: "openrouter", keyEnv: ["OPENROUTER_API_KEY"], keyLabel: "an sk-or- key", keyPattern: /^sk-or-/, defaultModel: "deepseek/deepseek-v4.1-flash" },
   { provider: "anthropic", keyEnv: ["ANTHROPIC_API_KEY"], keyLabel: "an sk-ant- key", keyPattern: /^sk-ant-/, defaultModel: "claude-haiku-4.5" },
   { provider: "google", keyEnv: ["GOOGLE_GENERATIVE_AI_API_KEY", "GEMINI_API_KEY"], keyLabel: "an AIza key", keyPattern: /^AIza/, defaultModel: "gemini-2.5-flash" },
 ];
@@ -618,3 +628,23 @@ export function parseCookieSpec(spec: string): SeedCookie {
   return { name: spec.slice(0, eq), value: spec.slice(eq + 1) };
 }
 
+
+/** Helium, the Chromium-based browser this machine uses instead of Playwright's download. */
+export const HELIUM_EXECUTABLE_PATH = "/usr/bin/helium-browser";
+
+/**
+ * Which browser binary to launch.
+ * - JEV_BROWSER_EXECUTABLE_PATH, when set, is used as given.
+ * - Otherwise Helium, when it is installed.
+ * - Otherwise undefined, which makes Playwright use its own Chromium (e.g. on CI).
+ * `fileExists` is passed in so this stays a pure helper.
+ */
+export function resolveBrowserExecutable(
+  env: NodeJS.ProcessEnv,
+  fileExists: (path: string) => boolean,
+): string | undefined {
+  const configuredPath = env.JEV_BROWSER_EXECUTABLE_PATH?.trim();
+  if (configuredPath) return configuredPath;
+  if (fileExists(HELIUM_EXECUTABLE_PATH)) return HELIUM_EXECUTABLE_PATH;
+  return undefined;
+}

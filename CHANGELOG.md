@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased (local)
+
+- Drop-down menus: toggles are described as menus (open/closed); a closed one is opened by hover, then click, then a click after the page finishes loading.
+- Waits for pages that first serve a blank, script-driven interstitial (e.g. nsf.gov) before the first step.
+- Helium is the default browser (`JEV_BROWSER_EXECUTABLE_PATH` overrides); no Chromium download on install.
+- OpenRouter Jev and typing calls carry `data_collection: deny` and `zdr: true`.
+- OpenRouter typing default moved to `deepseek/deepseek-v4.1-flash`; checked to answer short prompts with reasoning disabled and the privacy filter on.
+
 ## 0.8.1
 
 - Goal judgment now reads what a person sees — the open modal dialog, else the text in the viewport — instead of the start of the body, which is often navigation or banners; redacted credential runs keep the page-start excerpt. Via [#21](https://github.com/jkudish/jev-browser/pull/21).

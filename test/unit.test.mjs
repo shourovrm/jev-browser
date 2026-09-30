@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { existsSync } from "node:fs";
 import { chromium } from "playwright";
 import {
   buildActionSpace,
@@ -11,9 +12,167 @@ import {
   MAX_ELEMENTS,
   parseCookieSpec,
   pickAlternate,
+  resolveBrowserExecutable,
   resolveCookies,
+  HELIUM_EXECUTABLE_PATH,
 } from "../dist/lib.js";
 import { navigate } from "../dist/navigate.js";
+import { OPENROUTER_PRIVACY_FILTER, resolvePrivateTransport } from "../dist/provider.js";
+
+test("resolvePrivateTransport: OpenRouter Jev calls carry the no-training, zero-retention filter", async (t) => {
+  const sentBodies = [];
+  t.mock.method(globalThis, "fetch", async (_url, init) => {
+    sentBodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ answers: { q: { type: "noul", noul: 0.9 } }, usage: { input_tokens: 5 } }));
+  });
+  const transport = resolvePrivateTransport({ JEV_PROVIDER: "openrouter", OPENROUTER_API_KEY: "sk-or-test" });
+  const reply = await transport.ask({ state: "s", questions: {}, model: "jev-latest", signal: new AbortController().signal });
+  assert.equal(transport.name, "openrouter");
+  assert.deepEqual(sentBodies[0].provider, OPENROUTER_PRIVACY_FILTER);
+  assert.equal(sentBodies[0].model, "typesafe/jev-1.13");
+  assert.deepEqual(reply.usage, { input_tokens: 5, output_tokens: 0 });
+});
+
+test("navigate waits for a blank interstitial to reload into the real page before offering elements", async (t) => {
+  // Mimics nsf.gov: a blank, untitled page runs a script, then reloads into the real page.
+  const http = await import("node:http");
+  const server = http.createServer((request, response) => {
+    response.setHeader("Content-Type", "text/html");
+    if (request.url === "/real") {
+      response.end("<title>Real page</title><a href='/next'>Next page</a><button>Search</button>");
+    } else {
+      response.end("<html><body><script>setTimeout(() => location.replace('/real'), 1200)</script></body></html>");
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+
+  let offeredElementCount = null;
+  const probeTransport = {
+    name: "fixture",
+    async ask({ state }) {
+      offeredElementCount = (typeof state === "string" ? JSON.parse(state) : state).interactive_elements.length;
+      throw new Error("probe stop");
+    },
+  };
+  try {
+    await navigate({
+      task: "Open the next page",
+      startUrl: `http://127.0.0.1:${server.address().port}/`,
+      transport: probeTransport,
+      maxSteps: 1,
+      maxSeconds: 20,
+      screenshot: "none",
+    });
+  } catch (error) {
+    if (String(error).includes("Executable doesn't exist")) {
+      t.skip("Playwright browser binary is not installed");
+      return;
+    }
+    throw error;
+  }
+  assert.equal(offeredElementCount, 2);
+});
+
+test("buildActionSpace describes menu toggles and their open/closed state", () => {
+  const closedMenu = el({ attr: "j1", tag: "button", text: "Find Funding", href: "", menu: "closed" });
+  const openMenu = el({ attr: "j2", tag: "button", text: "About", href: "", menu: "open" });
+  const { elements } = buildActionSpace([closedMenu, openMenu]);
+  assert.equal(elements[0].kind, "click");
+  assert.equal(elements[0].description, 'button "Find Funding" (menu, closed; clicking shows its items)');
+  assert.equal(elements[1].description, 'button "About" (menu, open)');
+});
+
+async function runMenuScenario(t, pageHtml, menuLabel, scripts = {}) {
+  // Step 1 clicks the menu toggle; step 2 records what is offered and answers done.
+  const http = await import("node:http");
+  const server = http.createServer((request, response) => {
+    const script = scripts[request.url];
+    if (script) {
+      response.setHeader("Content-Type", "text/javascript");
+      setTimeout(() => response.end(script.body), script.delayMs);
+      return;
+    }
+    response.setHeader("Content-Type", "text/html");
+    response.end(pageHtml);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.closeAllConnections?.() ?? server.close());
+  const offeredPerStep = [];
+  const transport = {
+    name: "fixture",
+    async ask({ state, questions }) {
+      const parsed = typeof state === "string" ? JSON.parse(state) : state;
+      offeredPerStep.push(parsed.interactive_elements.map((element) => element.description));
+      const answers = {};
+      for (const [id, question] of Object.entries(questions)) {
+        if (question.type === "noul") {
+          answers[id] = { type: "noul", noul: 0 };
+          continue;
+        }
+        const keys = Object.keys(question.criteria);
+        const menuKey = keys.find((key) => question.criteria[key].includes(menuLabel));
+        const pick = offeredPerStep.length === 1 && menuKey ? menuKey : "done";
+        answers[id] = { type: "choice", choice: pick, confidence: 1, probabilities: Object.fromEntries(keys.map((key) => [key, key === pick ? 1 : 0])) };
+      }
+      return { answers, usage: { input_tokens: 1, output_tokens: 1 }, model: "fixture" };
+    },
+  };
+  const result = await navigate({
+    task: "Open the Award Search page",
+    startUrl: `http://127.0.0.1:${server.address().port}/`,
+    transport,
+    maxSteps: 2,
+    maxSeconds: 30,
+    screenshot: "none",
+  });
+  return { offeredPerStep, result };
+}
+
+test("a menu whose script loads late still opens: jev-browser waits and clicks again", async (t) => {
+  // Like nsf.gov: the toggle ignores clicks until the site's menu script has downloaded.
+  const pageHtml = `<!doctype html><title>Late menu</title><p>Welcome</p>
+    <button id="toggle" aria-expanded="false" aria-controls="menu">Products</button>
+    <ul id="menu" style="display:none"><li><a href="/awards">Award Search</a></li></ul>
+    <script src="/menu.js" async></script>`;
+  const menuScript = `document.getElementById("toggle").addEventListener("click", () => {
+    document.getElementById("menu").style.display = "block";
+    document.getElementById("toggle").setAttribute("aria-expanded", "true");
+  });`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, "Products", { "/menu.js": { body: menuScript, delayMs: 2500 } });
+  assert.ok(offeredPerStep[0].some((description) => description.includes("(menu, closed")), "step 1 should describe the toggle as a closed menu");
+  assert.ok(offeredPerStep[1].some((description) => description.includes("Award Search")), "the menu item should be offered after the click");
+  assert.match(result.steps[0].detail, /opened menu/);
+});
+
+test("a hover-only menu opens by hovering when clicking does nothing", async (t) => {
+  const pageHtml = `<!doctype html><title>Hover menu</title><style>
+    .nav .sub { display: none } .nav:hover .sub { display: block }</style><p>Welcome</p>
+    <div class="nav"><button aria-haspopup="true">Products</button>
+    <ul class="sub"><li><a href="/awards">Award Search</a></li></ul></div>`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, "Products");
+  assert.ok(offeredPerStep[1].some((description) => description.includes("Award Search")), "the menu item should be offered after hovering");
+  assert.match(result.steps[0].detail, /opened menu by hovering/);
+});
+
+test("resolvePrivateTransport: other providers are left as they are", () => {
+  const transport = resolvePrivateTransport({ JEV_PROVIDER: "typesafe", TYPESAFE_API_KEY: "ts_test" });
+  assert.equal(transport.name, "typesafe");
+});
+
+test("resolveBrowserExecutable: JEV_BROWSER_EXECUTABLE_PATH wins", () => {
+  const env = { JEV_BROWSER_EXECUTABLE_PATH: " /opt/chrome/chrome " };
+  assert.equal(resolveBrowserExecutable(env, () => true), "/opt/chrome/chrome");
+});
+
+test("resolveBrowserExecutable: defaults to Helium when it is installed", () => {
+  assert.equal(resolveBrowserExecutable({}, (path) => path === HELIUM_EXECUTABLE_PATH), HELIUM_EXECUTABLE_PATH);
+});
+
+test("resolveBrowserExecutable: falls back to Playwright's own browser when Helium is absent", () => {
+  assert.equal(resolveBrowserExecutable({}, () => false), undefined);
+  assert.equal(resolveBrowserExecutable({ JEV_BROWSER_EXECUTABLE_PATH: "  " }, () => false), undefined);
+});
 
 const el = (over = {}) => ({
   attr: "j1",
@@ -560,7 +719,7 @@ test("assertNoPlaywrightDebug refuses debug modes that log filled values", () =>
 test("navigate reuses an injected Playwright page and leaves its lifecycle to the caller", async (t) => {
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   } catch (error) {
     if (String(error).includes("Executable doesn't exist")) {
       t.skip("Playwright browser binary is not installed");
@@ -631,7 +790,7 @@ test("navigate requires startUrl when no page is supplied", async () => {
 test("navigate refuses credential runs on a recording injected page", async (t) => {
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   } catch (error) {
     if (String(error).includes("Executable doesn't exist")) {
       t.skip("Playwright browser binary is not installed");
@@ -664,7 +823,7 @@ test("navigate refuses credential runs on a recording injected page", async (t) 
 test("injected credential pages suppress the screenshot even before any fill", async (t) => {
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   } catch (error) {
     if (String(error).includes("Executable doesn't exist")) {
       t.skip("Playwright browser binary is not installed");
@@ -717,7 +876,7 @@ test("resolveTypingSelection auto-detects in candidate order (a stale openai key
   assert.equal(both.modelId, "gpt-5.6-luna");
   const or = resolveTypingSelection({ OPENROUTER_API_KEY: "sk-or-v1-openrouter-key-0123456789" });
   assert.equal(or.provider, "openrouter");
-  assert.equal(or.modelId, "google/gemini-2.5-flash-lite"); // code default, not the stale README one
+  assert.equal(or.modelId, "deepseek/deepseek-v4.1-flash"); // code default, not the stale README one
   const google = resolveTypingSelection({ GEMINI_API_KEY: "AIza-google-key-0123456789" });
   assert.equal(google.provider, "google");
   assert.equal(google.modelId, "gemini-2.5-flash");
@@ -740,7 +899,7 @@ test("resolveTypingSelection: BASE_URL selects a compatible endpoint; TYPE_PROVI
     JEV_BROWSER_TYPE_BASE_URL: "http://127.0.0.1:1",
   });
   assert.equal(layered.provider, "openrouter");
-  assert.equal(layered.modelId, "google/gemini-2.5-flash-lite");
+  assert.equal(layered.modelId, "deepseek/deepseek-v4.1-flash");
   assert.equal(layered.baseUrl, "http://127.0.0.1:1");
   // BASE_URL must at least be a valid absolute http(s) URL
   assert.throws(() => resolveTypingSelection({ JEV_BROWSER_TYPE_BASE_URL: "not a url" }), /JEV_BROWSER_TYPE_BASE_URL/);
@@ -863,7 +1022,7 @@ test("generateTextToType: openrouter requests disabled reasoning and the raised 
   try {
     const generator = createTypingGenerator({ OPENROUTER_API_KEY: "sk-or-v1-openrouter-key-0123456789" });
     assert.equal(generator.provider, "openrouter");
-    assert.equal(generator.modelId, "google/gemini-2.5-flash-lite");
+    assert.equal(generator.modelId, "deepseek/deepseek-v4.1-flash");
     const out = await generateTextToType(new AbortController().signal, generator, "task", "the search box", "https://x.test/");
     assert.deepEqual(out, { ok: true, text: "ristretto", via: "openrouter" });
     assert.match(seen.url, /openrouter\.ai\/api\/v1\/chat\/completions/);
@@ -1342,7 +1501,7 @@ test("navigate refuses cookie values that could never be redacted reliably", asy
 test("cookie runs are credential runs end to end: seeded, gated, redacted, unscreenrecorded", async (t) => {
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   } catch (error) {
     if (String(error).includes("Executable doesn't exist")) {
       t.skip("Playwright browser binary is not installed");
@@ -1413,7 +1572,7 @@ test("cookie runs are credential runs end to end: seeded, gated, redacted, unscr
 test("the judged excerpt is the open dialog, else the text on screen", async (t) => {
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   } catch (error) {
     if (String(error).includes("Executable doesn't exist")) {
       t.skip("Playwright browser binary is not installed");
@@ -1471,7 +1630,7 @@ test("the judged excerpt is the open dialog, else the text on screen", async (t)
 test("credential runs judge the page-start excerpt so split-span secrets stay redactable", async (t) => {
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   } catch (error) {
     if (String(error).includes("Executable doesn't exist")) {
       t.skip("Playwright browser binary is not installed");
@@ -1524,7 +1683,7 @@ test("credential runs judge the page-start excerpt so split-span secrets stay re
 test("only modal dialogs hijack the excerpt; a plain open dialog and an empty viewport do not", async (t) => {
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   } catch (error) {
     if (String(error).includes("Executable doesn't exist")) {
       t.skip("Playwright browser binary is not installed");

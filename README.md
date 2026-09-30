@@ -33,7 +33,7 @@ Full-resolution video: [assets/github-demo.mp4](assets/github-demo.mp4).
 
 ## Install
 
-Requires Node.js 22 or newer, an API key for a Jev transport ([TypeSafe direct](https://console.typesafe.ai/settings/keys) is the default; alternatives are listed under [Configuration](#configuration)), and optionally a key for a typing provider (see [the typing model](#the-typing-model)). Playwright's Chromium downloads automatically on install; set `JEV_BROWSER_SKIP_BROWSER_DOWNLOAD=1` to opt out.
+Requires Node.js 22 or newer, an API key for a Jev transport ([TypeSafe direct](https://console.typesafe.ai/settings/keys) is the default; alternatives are listed under [Configuration](#configuration)), and optionally a key for a typing provider (see [the typing model](#the-typing-model)). Nothing is downloaded on install. The browser is `JEV_BROWSER_EXECUTABLE_PATH` when set, otherwise Helium at `/usr/bin/helium-browser` when installed, otherwise Playwright's own Chromium (install it yourself with `npx playwright install chromium`).
 
 ### Let an agent install it for you
 
@@ -385,7 +385,7 @@ Every run makes paid TypeSafe API calls, typically a fraction of a cent, plus on
   "degraded": false,
   "warnings": [],
   "typing_provider": "openrouter",
-  "typing_model": "google/gemini-2.5-flash-lite"
+  "typing_model": "deepseek/deepseek-v4.1-flash"
 }
 ```
 
@@ -431,7 +431,7 @@ Configuration is automatic when possible. With no typing overrides set, the serv
 | Provider | Recognized by | Default model |
 | --- | --- | --- |
 | OpenAI | `OPENAI_API_KEY` starting with `sk-` | `gpt-5.6-luna` |
-| OpenRouter | `OPENROUTER_API_KEY` starting with `sk-or-` | `google/gemini-2.5-flash-lite` |
+| OpenRouter | `OPENROUTER_API_KEY` starting with `sk-or-` | `deepseek/deepseek-v4.1-flash` |
 | Anthropic | `ANTHROPIC_API_KEY` starting with `sk-ant-` | `claude-haiku-4.5` |
 | Google | `GEMINI_API_KEY` or `GOOGLE_GENERATIVE_AI_API_KEY` starting with `AIza` | `gemini-2.5-flash` |
 
@@ -456,7 +456,7 @@ With no provider at all, or when the typing model fails or returns empty text, t
 
 - Up to 240 elements per step; Jev's Choice supports 255 options. Beyond that the list is truncated and the state says so, which can hide the needed element on very dense pages.
 - The markdown format converts the whole body, so it carries navigation chrome and can include inline script text; a readability pass is a candidate improvement, not a committed one.
-- Password fields are only ever filled by code, never typed by the model, and only when a password source is configured (see [Password fill](#password-fill-logins)); file inputs are never offered. Start behind a login with [seed cookies](#seed-cookies-start-behind-a-login) (`cookies` on `navigate()`, `--cookie-file` on the CLI, `cookie_file`/`cookie_env` on MCP). Hover-revealed menus, keyboard actions other than Enter within the explicit search and submit actions (Escape, Tab, arrow keys), shadow DOM, and iframes are out of scope for v0.1.
+- Password fields are only ever filled by code, never typed by the model, and only when a password source is configured (see [Password fill](#password-fill-logins)); file inputs are never offered. Start behind a login with [seed cookies](#seed-cookies-start-behind-a-login) (`cookies` on `navigate()`, `--cookie-file` on the CLI, `cookie_file`/`cookie_env` on MCP). Menu toggles (`aria-expanded` / `aria-haspopup`) are described to Jev as menus and opened by code: hover first, then click, then one more click after the page finishes loading, for sites whose menu script loads late. Keyboard actions other than Enter within the explicit search and submit actions (Escape, Tab, arrow keys), shadow DOM, and iframes are out of scope for v0.1. The plan for them is in [ROADMAP.md](ROADMAP.md).
 - Thresholds (0.85 goal, 0.85 stuck, budgets) are starting points measured on Wikipedia and DuckDuckGo tasks. Tune them for your sites.
 - Jev is calibrated, not infallible. Treat the trace as evidence, not proof.
 
@@ -485,7 +485,7 @@ The built-ins stay limited to major providers. For anything else, library caller
 | `JEV_BROWSER_MODEL` | `jev-latest` | Pin a Jev version, or `typesafe/jev-1.13` on OpenRouter. |
 | `JEV_BROWSER_TYPE_*` | see above | Typing provider, model, and endpoint. |
 | `JEV_BROWSER_HEADED` | unset | Set to `1` to watch the browser. |
-| `JEV_BROWSER_SKIP_BROWSER_DOWNLOAD` | unset | Set to `1` to skip the Chromium postinstall. |
+| `JEV_BROWSER_EXECUTABLE_PATH` | Helium if installed | Browser binary to launch. Falls back to `/usr/bin/helium-browser`, then Playwright's own Chromium. |
 | `JEV_BROWSER_PASSWORD_ORIGIN` | unset | Required for password fill: the exact origin password fields may be filled on. |
 | `JEV_BROWSER_HANDOFF_DIR` | `~/.jev-browser/handoff` | Directory password handoff files must live in (0700). |
 

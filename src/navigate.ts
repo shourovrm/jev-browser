@@ -9,6 +9,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { existsSync } from "node:fs";
 import TurndownService from "turndown";
 import * as gfm from "turndown-plugin-gfm";
 import {
@@ -20,6 +21,7 @@ import {
   pickAlternate,
   PRICE_PER_MTOK_IN,
   RawElement,
+  resolveBrowserExecutable,
   resolveCookies,
   resolveTypingSelection,
   SeedCookie,
@@ -33,7 +35,7 @@ import {
 } from "./lib.js";
 import { selectOptionQuestion, stepQuestions } from "./questions.js";
 import { assertNoPlaywrightDebug, makeRedactor, parseTrustedOrigin, validateSecretBuffer, type Redactor } from "./password.js";
-import { askJev as askProvider, InvalidJevAnswer, resolveTransport, type JevTransport, type JevAnswer } from "./provider.js";
+import { askJev as askProvider, InvalidJevAnswer, OPENROUTER_PRIVACY_FILTER, resolvePrivateTransport, type JevTransport, type JevAnswer } from "./provider.js";
 
 const MAX_CONSOLE_EVENTS = 200;
 const STATE_EXCERPT_CHARS = 1_500;
@@ -225,7 +227,7 @@ export async function generateTextToType(
   // it, so they keep their default thinking and just get the larger cap.
   const generationLimits =
     generator.provider === "openrouter"
-      ? { maxOutputTokens: 256, providerOptions: { openrouter: { reasoning: { enabled: false } } } }
+      ? { maxOutputTokens: 256, providerOptions: { openrouter: { reasoning: { enabled: false }, provider: OPENROUTER_PRIVACY_FILTER } } }
       : generator.provider === "google"
         ? { maxOutputTokens: 256, ...(GEMINI_FLASH_THINKING_OFF.test(generator.modelId) ? { reasoning: "none" as const } : {}) }
         : { maxOutputTokens: 48 };
@@ -366,6 +368,11 @@ async function extractAndStamp(
         if (!clickable && !typeable && !selectable && !(passwordInput && includePw)) continue;
         const attr = `j${out.length + 1}`;
         el.setAttribute("data-jev-id", attr);
+        const expandedAttr = el.getAttribute("aria-expanded");
+        const popupAttr = el.getAttribute("aria-haspopup");
+        let menu: "open" | "closed" | undefined;
+        if (clickable && expandedAttr === "true") menu = "open";
+        else if (clickable && (expandedAttr === "false" || (popupAttr !== null && popupAttr !== "false"))) menu = "closed";
         const options =
           tag === "select"
             ? Array.from((el as unknown as HTMLSelectElement).options)
@@ -376,7 +383,7 @@ async function extractAndStamp(
                 .filter((o) => o.label.length > 0)
                 .slice(0, 200)
             : undefined;
-        out.push({ attr, tag, role: roleAttr || tag, text: label.slice(0, cap.label), href, typeAttr, clickable, typeable, searchField, submitControl, enterSubmittable, selectable, passwordInput: passwordInput || undefined, options });
+        out.push({ attr, tag, role: roleAttr || tag, text: label.slice(0, cap.label), href, typeAttr, clickable, typeable, searchField, submitControl, enterSubmittable, selectable, passwordInput: passwordInput || undefined, options, menu });
       }
       return out;
     },
@@ -437,6 +444,66 @@ async function pageObservables(page: Page, bounded: (cap: number) => number, exc
     }), excerptCap)
     .catch(() => ({ length: 0, scrollY: 0, excerpt: "", visibleExcerpt: "" }));
   return { url, title, textLength: data.length, scrollY: data.scrollY, excerpt: data.excerpt, visibleExcerpt: data.visibleExcerpt };
+}
+
+/** What a menu toggle shows right now: its aria-expanded value and how many controls are visible. */
+async function menuSnapshot(page: Page, selector: string) {
+  return page
+    .evaluate((toggleSelector) => {
+      const toggle = document.querySelector(toggleSelector);
+      const visibleControls = Array.from(document.querySelectorAll("a, button, input, select, textarea, [role=menuitem]")).filter((control) => {
+        const box = control.getBoundingClientRect();
+        return box.width > 0 && box.height > 0 && getComputedStyle(control).visibility !== "hidden";
+      }).length;
+      return { expanded: toggle?.getAttribute("aria-expanded") ?? null, visibleControls };
+    }, selector)
+    .catch(() => ({ expanded: null, visibleControls: 0 }));
+}
+
+function menuOpened(before: { visibleControls: number }, after: { expanded: string | null; visibleControls: number }) {
+  return after.expanded === "true" || after.visibleControls > before.visibleControls;
+}
+
+// Menu toggles are opened by code rather than left to one click, because sites differ:
+// some menus open on hover only, and some ignore clicks until the site's scripts have
+// loaded (nsf.gov takes seconds after its text appears). Try hover, then click, then wait
+// for the page to finish loading and click again. Returns what happened, for the trace.
+async function openMenu(page: Page, selector: string, bounded: (cap: number) => number): Promise<string> {
+  const before = await menuSnapshot(page, selector);
+  const settleMenu = () => page.waitForTimeout(350);
+
+  await page.hover(selector, { timeout: bounded(4_000) });
+  await settleMenu();
+  if (menuOpened(before, await menuSnapshot(page, selector))) return "opened menu by hovering";
+
+  await page.click(selector, { timeout: bounded(4_000) });
+  await settleMenu();
+  if (menuOpened(before, await menuSnapshot(page, selector))) return "opened menu";
+
+  await page.waitForLoadState("networkidle", { timeout: bounded(6_000) }).catch(() => {});
+  await page.click(selector, { timeout: bounded(4_000) });
+  await settleMenu();
+  if (menuOpened(before, await menuSnapshot(page, selector))) return "opened menu after the page finished loading";
+  return "menu did not open";
+}
+
+// Some sites (nsf.gov among them) first serve a blank, untitled page that runs a script
+// and then reloads into the real one. Reading elements during that blank phase offers
+// Jev nothing but scroll/back/done, and settle() would call the empty DOM "stable".
+// So wait, bounded, until the page shows any text or control before the first step.
+async function waitForFirstContent(page: Page, bounded: (cap: number) => number) {
+  const deadline = performance.now() + bounded(12_000);
+  while (performance.now() < deadline) {
+    const hasContent = await page
+      .evaluate(
+        () =>
+          (document.body?.innerText?.trim().length ?? 0) > 0 ||
+          document.querySelectorAll("a,button,input,select,textarea").length > 0,
+      )
+      .catch(() => false); // evaluate throws while the page is navigating away
+    if (hasContent) return;
+    await page.waitForTimeout(250);
+  }
 }
 
 async function settle(page: Page, bounded: (cap: number) => number) {
@@ -544,7 +611,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
   // another provider. Runs with typing disabled ignore typing config at all,
   // so a broken config can always be worked around with allowTyping: false.
   const typingGenerator = allowTyping ? createTypingGenerator() : null;
-  const transport = options.transport ?? resolveTransport();
+  const transport = options.transport ?? resolvePrivateTransport();
 
   // One abort source per run: the wall-clock deadline, optionally composed
   // with caller cancellation (the MCP layer forwards its signal).
@@ -662,7 +729,10 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
 
   try {
     ownsBrowser = !options.page;
-    browser = options.page ? null : await chromium.launch({ headless: process.env.JEV_BROWSER_HEADED !== "1" });
+    browser = options.page ? null : await chromium.launch({
+      headless: process.env.JEV_BROWSER_HEADED !== "1",
+      executablePath: resolveBrowserExecutable(process.env, existsSync),
+    });
     const context: BrowserContext = options.page
       ? options.page.context()
       : await browser!.newContext({
@@ -703,6 +773,8 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
 
     if (startUrl) {
       await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: bounded(30_000) });
+      await waitForFirstContent(page, bounded);
+      await settle(page, bounded);
     }
 
     // Bot-protection interstitials are walls, not pages to reason about. The
@@ -1006,6 +1078,8 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
               detail = `filled password into "${pwLabel}"; not submitted`;
             }
           }
+        } else if (element.menu === "closed") {
+          detail = `${await openMenu(page, selectorFor(element), bounded)}: ${element.description}`;
         } else {
           await page.click(selectorFor(element), { timeout: bounded(4_000) });
           detail = element.description;

@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { existsSync } from "node:fs";
 import { chromium } from "playwright";
+import { resolveBrowserExecutable } from "../dist/lib.js";
 import { navigate } from "../dist/navigate.js";
 
 const serverPath = fileURLToPath(new URL("../dist/index.js", import.meta.url));
@@ -882,7 +884,7 @@ test("input submit without a value keeps the default Submit label", { skip: !has
 
 test("password fill: injected page works under the same guards and never closes the caller's browser", { skip: !hasKey }, async () => {
   const fixture = await serveFixture("password.html");
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   try {
     const context = await browser.newContext();
     const page = await context.newPage();
@@ -969,7 +971,7 @@ test("degraded type_eN: a dead typing provider types nothing and reports structu
         assert.ok(warning, `expected a typing_generator_error warning: ${JSON.stringify(body.warnings)}`);
         assert.equal(warning.step, failedType.step);
         assert.equal(warning.provider, "openrouter");
-        assert.equal(warning.model, "google/gemini-2.5-flash-lite");
+        assert.equal(warning.model, "deepseek/deepseek-v4.1-flash");
         assert.ok(warning.message.length <= 200, `warning message must stay short: ${warning.message}`);
         // Port 1 is on fetch's blocked-port list, so the SDK words the failure
         // "bad port" instead of ECONNREFUSED; either way the dead endpoint
@@ -978,7 +980,7 @@ test("degraded type_eN: a dead typing provider types nothing and reports structu
         assert.ok(!("fallback" in warning), "ordinary fields get no heuristic fallback");
         assert.ok(!("finish_reason" in warning));
         assert.equal(body.typing_provider, "openrouter");
-        assert.equal(body.typing_model, "google/gemini-2.5-flash-lite");
+        assert.equal(body.typing_model, "deepseek/deepseek-v4.1-flash");
       },
       DEAD_TYPING_ENV,
     );
@@ -1522,7 +1524,7 @@ test("cookie seeding: bad ingress is refused loudly, before any browser", async 
 });
 
 test("cookie seeding: an injected page is refused before it is touched", async () => {
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   try {
     const context = await browser.newContext();
     const page = await context.newPage();

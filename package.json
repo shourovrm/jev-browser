@@ -26,7 +26,6 @@
   },
   "files": [
     "dist",
-    "scripts",
     "README.md",
     "LICENSE",
     "SECURITY.md",
@@ -41,8 +40,7 @@
     "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "node --test test/unit.test.mjs test/transports.test.mjs test/http.test.mjs",
-    "test:e2e": "node --test test/e2e.test.mjs",
-    "postinstall": "node scripts/ensure-chromium.mjs"
+    "test:e2e": "node --test test/e2e.test.mjs"
   },
   "keywords": [
     "mcp",

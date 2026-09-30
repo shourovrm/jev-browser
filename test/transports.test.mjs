@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { existsSync } from "node:fs";
 import { chromium } from "playwright";
+import { resolveBrowserExecutable } from "../dist/lib.js";
 import { askJev, InvalidJevAnswer, resolveTransport } from "../dist/provider.js";
 import { navigate } from "../dist/library.js";
 
@@ -220,7 +222,7 @@ test("all adapters distinguish absent usage from malformed containers and presen
 test("injected transport drives both call sites and malformed second-stage answer executes nothing", async (t) => {
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch({ executablePath: resolveBrowserExecutable(process.env, existsSync) });
   } catch (error) {
     if (String(error).includes("Executable doesn't exist")) {
       t.skip("Playwright browser binary is not installed");
