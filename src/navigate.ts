@@ -276,8 +276,12 @@ async function extractAndStamp(
       // the candidate list keep their old data-jev-id, which would make
       // selectors match more than one element.
       document.querySelectorAll("[data-jev-id]").forEach((el) => el.removeAttribute("data-jev-id"));
+      // Menu items, list options and tabs are often plain <li> or <div>
+      // elements that carry only an ARIA role; without these roles an open
+      // menu or autocomplete list offers Jev nothing to pick.
       const SEL =
-        'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="searchbox"], [role="textbox"]';
+        'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="searchbox"], [role="textbox"], ' +
+        '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="tab"], [role="combobox"]';
       const out: any[] = [];
       for (const el of document.querySelectorAll(SEL) as NodeListOf<HTMLElement>) {
         // Cap accepted candidates AFTER filtering so hidden boilerplate at the
@@ -344,9 +348,13 @@ async function extractAndStamp(
             "",
         );
         const href = tag === "a" ? (el.getAttribute("href") || "").slice(0, cap.href) : "";
+        // A combobox that is an input is typed into; any other combobox is a
+        // control that opens its list when clicked.
+        const clickableRoles = ["button", "link", "menuitem", "menuitemcheckbox", "menuitemradio", "option", "tab"];
         const clickable =
           ["a", "button"].includes(tag) ||
-          ["button", "link"].includes(roleAttr) ||
+          clickableRoles.includes(roleAttr) ||
+          (roleAttr === "combobox" && !["input", "textarea", "select"].includes(tag)) ||
           ["submit", "button", "checkbox", "radio"].includes(typeAttr);
 
         const selectable = tag === "select";
@@ -373,6 +381,7 @@ async function extractAndStamp(
         let menu: "open" | "closed" | undefined;
         if (clickable && expandedAttr === "true") menu = "open";
         else if (clickable && (expandedAttr === "false" || (popupAttr !== null && popupAttr !== "false"))) menu = "closed";
+        const selected = el.getAttribute("aria-selected") === "true" || el.getAttribute("aria-checked") === "true";
         const options =
           tag === "select"
             ? Array.from((el as unknown as HTMLSelectElement).options)
@@ -383,7 +392,7 @@ async function extractAndStamp(
                 .filter((o) => o.label.length > 0)
                 .slice(0, 200)
             : undefined;
-        out.push({ attr, tag, role: roleAttr || tag, text: label.slice(0, cap.label), href, typeAttr, clickable, typeable, searchField, submitControl, enterSubmittable, selectable, passwordInput: passwordInput || undefined, options, menu });
+        out.push({ attr, tag, role: roleAttr || tag, text: label.slice(0, cap.label), href, typeAttr, clickable, typeable, searchField, submitControl, enterSubmittable, selectable, passwordInput: passwordInput || undefined, options, menu, selected: selected || undefined });
       }
       return out;
     },
@@ -451,7 +460,7 @@ async function menuSnapshot(page: Page, selector: string) {
   return page
     .evaluate((toggleSelector) => {
       const toggle = document.querySelector(toggleSelector);
-      const visibleControls = Array.from(document.querySelectorAll("a, button, input, select, textarea, [role=menuitem]")).filter((control) => {
+      const visibleControls = Array.from(document.querySelectorAll("a, button, input, select, textarea, [role=menuitem], [role=option]")).filter((control) => {
         const box = control.getBoundingClientRect();
         return box.width > 0 && box.height > 0 && getComputedStyle(control).visibility !== "hidden";
       }).length;

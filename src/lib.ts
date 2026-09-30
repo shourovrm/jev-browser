@@ -20,6 +20,7 @@ export interface RawElement {
   enterSubmittable?: boolean; // single-line text field: Enter submits its form (or runs the site's handler)
   options?: SelectOption[]; // options for selects, with their DOM index
   menu?: "open" | "closed"; // a menu toggle (aria-expanded / aria-haspopup) and its current state
+  selected?: boolean; // aria-selected or aria-checked is "true": the option, tab or menu item is chosen
 }
 
 /** One native <select> option: its DOM index and (scrubbed) label. */
@@ -73,6 +74,20 @@ function menuNote(menu: RawElement["menu"]): string {
   if (menu === "closed") return " (menu, closed; clicking shows its items)";
   if (menu === "open") return " (menu, open)";
   return "";
+}
+
+/**
+ * Tells Jev what an ARIA-only control is, since its tag (often li or div) says
+ * nothing, and whether it is already selected: without that, Jev cannot see
+ * that picking an option finished the task and keeps clicking it.
+ */
+function roleNote(role: string, selected: boolean | undefined): string {
+  let name = "";
+  if (role === "menuitem" || role === "menuitemcheckbox" || role === "menuitemradio") name = "menu item";
+  else if (role === "option") name = "option in a list";
+  else if (role === "tab") name = "tab";
+  if (!name) return "";
+  return selected ? ` (${name}, selected)` : ` (${name})`;
 }
 
 export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOptions = {}): { elements: PageElement[]; truncated: boolean } {
@@ -137,7 +152,7 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
               ? `${el.tag} "${label}" (type without submitting)`
               : kind === "select"
                 ? `${el.tag} "${label}" (dropdown; a follow-up picks the option)`
-                : `${el.tag} "${label}"${hrefTail}${menuNote(el.menu)}`,
+                : `${el.tag} "${label}"${hrefTail}${roleNote(el.role, el.selected)}${menuNote(el.menu)}`,
       options: kind === "select" ? (el.options ?? []) : undefined,
       menu: kind === "click" ? el.menu : undefined,
     });

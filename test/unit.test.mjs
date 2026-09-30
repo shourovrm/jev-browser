@@ -83,8 +83,9 @@ test("buildActionSpace describes menu toggles and their open/closed state", () =
   assert.equal(elements[1].description, 'button "About" (menu, open)');
 });
 
-async function runMenuScenario(t, pageHtml, menuLabel, scripts = {}) {
-  // Step 1 clicks the menu toggle; step 2 records what is offered and answers done.
+async function runMenuScenario(t, pageHtml, labelsToClick, scripts = {}) {
+  // Step N clicks the control whose description holds labelsToClick[N-1]; the
+  // step after the last label records what is offered and answers done.
   const http = await import("node:http");
   const server = http.createServer((request, response) => {
     const script = scripts[request.url];
@@ -111,8 +112,9 @@ async function runMenuScenario(t, pageHtml, menuLabel, scripts = {}) {
           continue;
         }
         const keys = Object.keys(question.criteria);
-        const menuKey = keys.find((key) => question.criteria[key].includes(menuLabel));
-        const pick = offeredPerStep.length === 1 && menuKey ? menuKey : "done";
+        const wantedLabel = labelsToClick[offeredPerStep.length - 1];
+        const wantedKey = wantedLabel ? keys.find((key) => question.criteria[key].includes(wantedLabel)) : undefined;
+        const pick = wantedKey ?? "done";
         answers[id] = { type: "choice", choice: pick, confidence: 1, probabilities: Object.fromEntries(keys.map((key) => [key, key === pick ? 1 : 0])) };
       }
       return { answers, usage: { input_tokens: 1, output_tokens: 1 }, model: "fixture" };
@@ -122,7 +124,7 @@ async function runMenuScenario(t, pageHtml, menuLabel, scripts = {}) {
     task: "Open the Award Search page",
     startUrl: `http://127.0.0.1:${server.address().port}/`,
     transport,
-    maxSteps: 2,
+    maxSteps: labelsToClick.length + 1,
     maxSeconds: 30,
     screenshot: "none",
   });
@@ -139,7 +141,7 @@ test("a menu whose script loads late still opens: jev-browser waits and clicks a
     document.getElementById("menu").style.display = "block";
     document.getElementById("toggle").setAttribute("aria-expanded", "true");
   });`;
-  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, "Products", { "/menu.js": { body: menuScript, delayMs: 2500 } });
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, ["Products"], { "/menu.js": { body: menuScript, delayMs: 2500 } });
   assert.ok(offeredPerStep[0].some((description) => description.includes("(menu, closed")), "step 1 should describe the toggle as a closed menu");
   assert.ok(offeredPerStep[1].some((description) => description.includes("Award Search")), "the menu item should be offered after the click");
   assert.match(result.steps[0].detail, /opened menu/);
@@ -150,9 +152,76 @@ test("a hover-only menu opens by hovering when clicking does nothing", async (t)
     .nav .sub { display: none } .nav:hover .sub { display: block }</style><p>Welcome</p>
     <div class="nav"><button aria-haspopup="true">Products</button>
     <ul class="sub"><li><a href="/awards">Award Search</a></li></ul></div>`;
-  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, "Products");
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, ["Products"]);
   assert.ok(offeredPerStep[1].some((description) => description.includes("Award Search")), "the menu item should be offered after hovering");
   assert.match(result.steps[0].detail, /opened menu by hovering/);
+});
+
+test("buildActionSpace tells Jev which controls are menu items, list options and tabs", () => {
+  const { elements } = buildActionSpace([
+    el({ attr: "j1", tag: "li", role: "menuitem", text: "Award Search", href: "" }),
+    el({ attr: "j2", tag: "div", role: "option", text: "Espresso", href: "" }),
+    el({ attr: "j3", tag: "div", role: "tab", text: "Details", href: "" }),
+    el({ attr: "j4", tag: "a", role: "menuitemcheckbox", text: "Show archived", href: "" }),
+  ]);
+  assert.deepEqual(
+    elements.map((element) => element.description),
+    ['li "Award Search" (menu item)', 'div "Espresso" (option in a list)', 'div "Details" (tab)', 'a "Show archived" (menu item)'],
+  );
+});
+
+test("buildActionSpace says which option, tab or checkable menu item is selected", () => {
+  const { elements } = buildActionSpace([
+    el({ attr: "j1", tag: "li", role: "option", text: "Neptunium", href: "", selected: true }),
+    el({ attr: "j2", tag: "div", role: "tab", text: "Hours", href: "", selected: true }),
+    el({ attr: "j3", tag: "li", role: "menuitemcheckbox", text: "Show archived", href: "", selected: true }),
+    el({ attr: "j4", tag: "li", role: "option", text: "Plutonium", href: "", selected: false }),
+  ]);
+  assert.deepEqual(
+    elements.map((element) => element.description),
+    ['li "Neptunium" (option in a list, selected)', 'div "Hours" (tab, selected)', 'li "Show archived" (menu item, selected)', 'li "Plutonium" (option in a list)'],
+  );
+});
+
+test("the scan reads aria-selected and aria-checked into the selected state", async (t) => {
+  const pageHtml = `<!doctype html><title>Listbox</title><ul role="listbox">
+    <li role="option" aria-selected="true">Neptunium</li><li role="option" aria-selected="false">Plutonium</li></ul>
+    <ul role="menu"><li role="menuitemcheckbox" aria-checked="true">Show archived</li></ul>`;
+  const { offeredPerStep } = await runMenuScenario(t, pageHtml, []);
+  assert.ok(offeredPerStep[0].includes('li "Neptunium" (option in a list, selected)'));
+  assert.ok(offeredPerStep[0].includes('li "Plutonium" (option in a list)'));
+  assert.ok(offeredPerStep[0].includes('li "Show archived" (menu item, selected)'));
+});
+
+test("menu items that are plain list elements are offered and clicked", async (t) => {
+  const pageHtml = `<!doctype html><title>Menubar</title><p>Welcome</p>
+    <ul role="menubar"><li role="menuitem" tabindex="0" onclick="location.href='/awards'">Award Search</li>
+    <li role="menuitem" tabindex="-1">Funding</li></ul>`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, ["Award Search"]);
+  assert.ok(offeredPerStep[0].includes('li "Award Search" (menu item)'), "the menu item should be offered");
+  assert.match(result.final_url, /\/awards$/);
+});
+
+test("autocomplete options that are plain divs are offered and picked", async (t) => {
+  const pageHtml = `<!doctype html><title>Autocomplete</title><p>Pick a drink</p>
+    <div role="combobox" tabindex="0" aria-expanded="false" aria-controls="list" id="box"
+      onclick="document.getElementById('list').hidden = false; this.setAttribute('aria-expanded', 'true')">Choose a drink</div>
+    <div role="listbox" id="list" hidden>
+      <div role="option" onclick="location.href='/tea'">Tea</div>
+      <div role="option" onclick="location.href='/espresso'">Espresso</div>
+    </div>`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, ["Choose a drink", "Espresso"]);
+  assert.ok(offeredPerStep[1].includes('div "Espresso" (option in a list)'), "the option should be offered once the list is open");
+  assert.match(result.final_url, /\/espresso$/);
+});
+
+test("tabs that are plain divs are offered and switch the panel", async (t) => {
+  const pageHtml = `<!doctype html><title>Tabs</title>
+    <div role="tablist"><div role="tab" aria-selected="true">Overview</div>
+    <div role="tab" onclick="document.getElementById('panel').textContent = 'Opening hours: 9 to 5'">Hours</div></div>
+    <div id="panel">Welcome to the cafe</div>`;
+  const { result } = await runMenuScenario(t, pageHtml, ["Hours"]);
+  assert.equal(result.steps[0].detail, 'div "Hours" (tab)');
 });
 
 test("resolvePrivateTransport: other providers are left as they are", () => {
