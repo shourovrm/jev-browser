@@ -224,6 +224,16 @@ test("tabs that are plain divs are offered and switch the panel", async (t) => {
   assert.equal(result.steps[0].detail, 'div "Hours" (tab)');
 });
 
+test("the first click waits for the page's load event, so late scripts have attached their handlers", async (t) => {
+  // Like the W3C listbox example: the option only reacts once an async script has run.
+  const pageHtml = `<!doctype html><title>Late handlers</title><p>Pick a drink</p>
+    <ul role="listbox"><li role="option" id="tea">Tea</li><li role="option" id="espresso">Espresso</li></ul>
+    <script src="/listbox.js" async></script>`;
+  const listboxScript = `document.getElementById("espresso").addEventListener("click", () => { location.href = "/espresso"; });`;
+  const { result } = await runMenuScenario(t, pageHtml, ["Espresso"], { "/listbox.js": { body: listboxScript, delayMs: 2500 } });
+  assert.match(result.final_url, /\/espresso$/);
+});
+
 test("resolvePrivateTransport: other providers are left as they are", () => {
   const transport = resolvePrivateTransport({ JEV_PROVIDER: "typesafe", TYPESAFE_API_KEY: "ts_test" });
   assert.equal(transport.name, "typesafe");

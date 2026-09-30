@@ -517,6 +517,10 @@ async function waitForFirstContent(page: Page, bounded: (cap: number) => number)
 
 async function settle(page: Page, bounded: (cap: number) => number) {
   await page.waitForLoadState("domcontentloaded", { timeout: bounded(4_000) }).catch(() => {});
+  // Async scripts attach their click handlers before the load event, not
+  // before DOMContentLoaded; a click in between lands on a control that does
+  // nothing yet. Bounded, because ads and trackers can hold load back for long.
+  await page.waitForLoadState("load", { timeout: bounded(5_000) }).catch(() => {});
   // DOM-stability settle: two consecutive identical fingerprints mean the page
   // has stopped re-rendering, which is the signal we actually want; quiet
   // network was only ever a proxy for it, and analytics pings keep heavy sites

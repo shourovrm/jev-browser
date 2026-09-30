@@ -2,6 +2,7 @@
 
 ## Unreleased (local)
 
+- After each page load, waits (bounded, 5 s) for the page's `load` event, so async scripts have attached their click handlers before the first action.
 - Menu items, list options, tabs and non-input comboboxes are offered by ARIA role even when they are plain `li` or `div` elements; their description names the role and whether the item is selected.
 - Drop-down menus: toggles are described as menus (open/closed); a closed one is opened by hover, then click, then a click after the page finishes loading.
 - Waits for pages that first serve a blank, script-driven interstitial (e.g. nsf.gov) before the first step.
