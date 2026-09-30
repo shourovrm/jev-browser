@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { chromium } from "playwright";
 import {
   buildActionSpace,
+  buildKeyActions,
   buildCriteria,
   detectBotProtection,
   heuristicQuery,
@@ -83,7 +84,7 @@ test("buildActionSpace describes menu toggles and their open/closed state", () =
   assert.equal(elements[1].description, 'button "About" (menu, open)');
 });
 
-async function runMenuScenario(t, pageHtml, labelsToClick, scripts = {}) {
+async function runMenuScenario(t, pageHtml, labelsToClick, scripts = {}, stuckAtSteps = []) {
   // Step N clicks the control whose description holds labelsToClick[N-1]; the
   // step after the last label records what is offered and answers done.
   const http = await import("node:http");
@@ -110,7 +111,8 @@ async function runMenuScenario(t, pageHtml, labelsToClick, scripts = {}) {
       const answers = {};
       for (const [id, question] of Object.entries(questions)) {
         if (question.type === "noul") {
-          answers[id] = { type: "noul", noul: 0 };
+          const stuck = id === "stuck" && stuckAtSteps.includes(offeredPerStep.length);
+          answers[id] = { type: "noul", noul: stuck ? 0.95 : 0 };
           continue;
         }
         const keys = Object.keys(question.criteria);
@@ -360,6 +362,121 @@ test("a page rendered entirely inside a component still counts as content", asyn
   assert.ok(result.elapsed_ms < 8_000, `run took ${result.elapsed_ms} ms`);
 });
 
+test("buildKeyActions offers menu keys only when focus is inside a menu, and arrows that match its layout", () => {
+  assert.deepEqual(buildKeyActions(null), {});
+  const listbox = buildKeyActions({ role: "listbox", label: "Drinks", activeItem: "Tea" });
+  assert.deepEqual(Object.keys(listbox), ["press_down", "press_up", "press_enter", "press_escape"]);
+  assert.equal(listbox.press_enter, 'Press Enter in the focused listbox "Drinks" (highlighted: "Tea"): activates the highlighted item');
+  const menubar = buildKeyActions({ role: "menubar", label: "", activeItem: "Home" });
+  assert.deepEqual(Object.keys(menubar), ["press_right", "press_left", "press_down", "press_up", "press_enter", "press_escape"]);
+  assert.match(menubar.press_right, /^Press the Right arrow key in the focused menubar \(highlighted: "Home"\): /);
+});
+
+test("buildCriteria appends the key actions before the loop controls", () => {
+  const keyActions = buildKeyActions({ role: "menu", label: "Products", activeItem: "" });
+  const criteria = buildCriteria([], keyActions);
+  assert.deepEqual(Object.keys(criteria), ["press_down", "press_up", "press_enter", "press_escape", "scroll_down", "scroll_up", "back", "done"]);
+});
+
+// The keyboard tests check in-page effects rather than navigations: in a
+// freshly launched Helium, the built-in uBlock Origin holds navigation
+// requests for the first few seconds and then reloads the tab, which can
+// drop a navigation that a multi-step fixture starts in that window.
+
+// A horizontal menubar with a roving tabindex: clicks only focus an item;
+// arrow keys move between items and Enter opens the focused one.
+const keyboardMenubar = `<!doctype html><title>Keyboard menubar</title><p>Welcome</p>
+  <ul role="menubar" id="bar">
+    <li role="menuitem" tabindex="0">Home</li>
+    <li role="menuitem" tabindex="-1">About</li>
+    <li role="menuitem" tabindex="-1">Contact</li>
+  </ul>
+  <p id="opened"></p>
+  <script>
+    const items = [...document.querySelectorAll("#bar [role=menuitem]")];
+    document.getElementById("bar").addEventListener("keydown", (event) => {
+      const index = items.indexOf(document.activeElement);
+      if (event.key === "ArrowRight") items[(index + 1) % items.length].focus();
+      if (event.key === "ArrowLeft") items[(index + items.length - 1) % items.length].focus();
+      if (event.key === "Enter") document.getElementById("opened").textContent = "Opened the " + document.activeElement.textContent + " page";
+    });
+  </script>`;
+
+test("a menubar that only responds to arrow keys and Enter reaches its target item", async (t) => {
+  const { offeredPerStep, result } = await runMenuScenario(t, keyboardMenubar, ["Home", "Right arrow", "Right arrow", "Press Enter"]);
+  assert.ok(!offeredPerStep[0].some((description) => description.startsWith("Press ")), "no key actions before focus is in the menubar");
+  assert.equal(result.steps[1].executed_action, "press_right");
+  assert.equal(result.steps[2].executed_action, "press_right", "a repeated arrow key that moved the highlight is not switched away by repeat recovery");
+  assert.equal(result.steps[2].outcome, 'highlighted "Contact"');
+  assert.match(result.page.content, /Opened the Contact page/);
+});
+
+test("an autocomplete combobox picks a suggestion with arrow keys and Enter", async (t) => {
+  const pageHtml = `<!doctype html><title>Autocomplete</title>
+    <input role="combobox" aria-label="Drink" aria-controls="list" aria-expanded="true" value="e" autofocus>
+    <ul role="listbox" id="list"><li role="option" id="tea">Tea</li><li role="option" id="espresso">Espresso</li></ul>
+    <p id="picked"></p>
+    <script>
+      const input = document.querySelector("input");
+      const options = [...document.querySelectorAll("[role=option]")];
+      let active = -1;
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowDown") active = Math.min(active + 1, options.length - 1);
+        if (event.key === "ArrowUp") active = Math.max(active - 1, 0);
+        if (active >= 0) input.setAttribute("aria-activedescendant", options[active].id);
+        if (event.key === "Enter" && active >= 0) document.getElementById("picked").textContent = "Picked " + options[active].textContent;
+      });
+    </script>`;
+  const { result } = await runMenuScenario(t, pageHtml, ["Down arrow", "Down arrow", "Press Enter"]);
+  assert.deepEqual(result.steps.slice(0, 3).map((step) => step.executed_action), ["press_down", "press_down", "press_enter"]);
+  assert.equal(result.steps[1].outcome, 'highlighted "Espresso"');
+  assert.match(result.page.content, /Picked Espresso/);
+});
+
+// A menu that covers the page when opened and closes on Escape.
+const menuOpenedByMistake = `<!doctype html><title>Covering menu</title>
+  <button id="toggle" aria-haspopup="menu" aria-expanded="false">Products</button>
+  <button id="contact" style="position: absolute; top: 200px"
+    onclick="document.getElementById('reply').textContent = 'Call us on 555 0100'">Contact us</button>
+  <p id="reply" style="position: absolute; top: 260px"></p>
+  <ul role="menu" id="menu" hidden style="position: fixed; inset: 40px 0 0 0; background: white; margin: 0">
+    <li role="menuitem" tabindex="-1">Coffee beans</li><li role="menuitem" tabindex="-1">Grinders</li>
+  </ul>
+  <script>
+    const toggle = document.getElementById("toggle");
+    const menu = document.getElementById("menu");
+    toggle.addEventListener("click", () => {
+      menu.hidden = false;
+      toggle.setAttribute("aria-expanded", "true");
+      menu.querySelector("[role=menuitem]").focus();
+    });
+    menu.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      menu.hidden = true;
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.focus();
+    });
+  </script>`;
+
+test("a menu opened by mistake is closed with Escape and the next action succeeds", async (t) => {
+  const { result } = await runMenuScenario(t, menuOpenedByMistake, ["Products", "Press Escape", "Contact us"]);
+  assert.equal(result.steps[1].executed_action, "press_escape");
+  assert.match(result.page.content, /Call us on 555 0100/);
+});
+
+test("when the stuck watcher fires while a menu has focus, Escape is pressed once instead of stopping", async (t) => {
+  const { result } = await runMenuScenario(t, menuOpenedByMistake, ["Products", "Scroll down", "Contact us", "Contact us"], {}, [3]);
+  assert.equal(result.steps[2].proposed_action.startsWith("click_"), true);
+  assert.equal(result.steps[2].executed_action, "press_escape");
+  assert.match(result.steps[2].recovery_reason, /stuck watcher fired while a menu had focus/);
+  assert.match(result.page.content, /Call us on 555 0100/);
+});
+
+test("the stuck watcher still stops the run when no menu has focus", async (t) => {
+  const { result } = await runMenuScenario(t, keyboardMenubar, ["Scroll down", "Scroll down", "Scroll down"], {}, [3]);
+  assert.equal(result.status, "stuck");
+});
+
 test("resolvePrivateTransport: other providers are left as they are", () => {
   const transport = resolvePrivateTransport({ JEV_PROVIDER: "typesafe", TYPESAFE_API_KEY: "ts_test" });
   assert.equal(transport.name, "typesafe");
@@ -512,7 +629,8 @@ test("buildCriteria stays within the Choice option limit and includes controls",
     el({ attr: `j${i + 1}`, text: `Link ${i}`, href: `https://x.example/${i}` }),
   );
   const { elements } = buildActionSpace(many);
-  const criteria = buildCriteria(elements);
+  // Worst case: a full element list plus a focused menubar's six key actions.
+  const criteria = buildCriteria(elements, buildKeyActions({ role: "menubar", label: "", activeItem: "" }));
   assert.ok(Object.keys(criteria).length <= 255);
   for (const control of ["scroll_down", "scroll_up", "back", "done"]) {
     assert.ok(criteria[control], `missing control ${control}`);

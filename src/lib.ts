@@ -177,12 +177,53 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
   return { elements, truncated: elements.length >= MAX_ELEMENTS };
 }
 
-/** Jev Choice criteria for one step: element actions plus loop controls. */
-export function buildCriteria(elements: PageElement[]): Record<string, string> {
+/** The menu-like widget that holds keyboard focus: menu, menubar, listbox or combobox. */
+export interface FocusedMenu {
+  role: string;
+  label: string;
+  activeItem: string; // the highlighted item's text: the focused item, or the aria-activedescendant target
+}
+
+/** Key action name -> the key Playwright presses for it. */
+export const MENU_KEYS: Record<string, string> = {
+  press_right: "ArrowRight",
+  press_left: "ArrowLeft",
+  press_down: "ArrowDown",
+  press_up: "ArrowUp",
+  press_enter: "Enter",
+  press_escape: "Escape",
+};
+
+/**
+ * Key actions for the menu that holds focus, following the ARIA menu,
+ * listbox and combobox patterns: arrows move the highlight, Enter activates
+ * it, Escape closes. A menubar is horizontal, so it also gets Right and Left.
+ * No other keys are offered, which keeps the action list small.
+ */
+export function buildKeyActions(focused: FocusedMenu | null): Record<string, string> {
+  if (!focused) return {};
+  const label = focused.label ? ` "${focused.label.slice(0, 60)}"` : "";
+  const highlighted = focused.activeItem ? ` (highlighted: "${focused.activeItem.slice(0, 60)}")` : "";
+  const where = `in the focused ${focused.role}${label}${highlighted}`;
+  const actions: Record<string, string> = {};
+  if (focused.role === "menubar") {
+    actions.press_right = `Press the Right arrow key ${where}: moves to the next menu`;
+    actions.press_left = `Press the Left arrow key ${where}: moves to the previous menu`;
+  }
+  actions.press_down = `Press the Down arrow key ${where}: moves to the next item`;
+  actions.press_up = `Press the Up arrow key ${where}: moves to the previous item`;
+  actions.press_enter = `Press Enter ${where}: activates the highlighted item`;
+  actions.press_escape = `Press Escape ${where}: closes it`;
+  return actions;
+}
+
+/** Jev Choice criteria for one step: element actions, key actions for a focused menu, then loop controls. */
+export function buildCriteria(elements: PageElement[], keyActions: Record<string, string> = {}): Record<string, string> {
   const criteria: Record<string, string> = {};
   for (const el of elements) {
     criteria[`${el.kind}_${el.id}`] = el.description;
   }
+  Object.assign(criteria, keyActions);
   criteria["scroll_down"] = "Scroll down one screen to reveal more of the page";
   criteria["scroll_up"] = "Scroll up one screen";
   criteria["back"] = "Go back to the previous page; this branch is wrong";

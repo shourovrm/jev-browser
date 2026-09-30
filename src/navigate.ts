@@ -15,6 +15,9 @@ import * as gfm from "turndown-plugin-gfm";
 import {
   buildActionSpace,
   buildCriteria,
+  buildKeyActions,
+  FocusedMenu,
+  MENU_KEYS,
   classifyTypingFailure,
   detectBotProtection,
   heuristicQuery,
@@ -587,6 +590,38 @@ async function openMenu(page: Page, selector: string, bounded: (cap: number) => 
   return "menu did not open";
 }
 
+/**
+ * The menu, menubar, listbox or combobox that holds keyboard focus, or null.
+ * Focus is followed into shadow roots, and the container is found along the
+ * flat tree, so the focused item may be slotted into a component's menu.
+ */
+async function focusedMenu(page: Page, textCap: number): Promise<FocusedMenu | null> {
+  return page
+    .evaluate((cap) => {
+      const clean = (s: string | null | undefined) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, cap);
+      let focused: Element | null = document.activeElement;
+      while (focused?.shadowRoot?.activeElement) focused = focused.shadowRoot.activeElement;
+      if (!focused || focused === document.body) return null;
+      let container: Element | null = null;
+      for (let node: Node | null = focused; node && !container; node = (node as Element).assignedSlot ?? node.parentNode ?? (node as ShadowRoot).host ?? null) {
+        if (node instanceof Element && ["menu", "menubar", "listbox", "combobox"].includes(node.getAttribute("role") ?? "")) container = node;
+      }
+      if (!container) return null;
+      const root = focused.getRootNode() as Document | ShadowRoot;
+      const lookUp = (ids: string | null) => (ids ?? "").split(/\s+/).map((id) => (id ? root.getElementById(id)?.textContent : "") ?? "").join(" ");
+      // Comboboxes and listboxes keep focus on themselves and point at the
+      // highlighted option with aria-activedescendant; menus move focus.
+      const activeId = focused.getAttribute("aria-activedescendant") || container.getAttribute("aria-activedescendant");
+      const activeItem = activeId ? root.getElementById(activeId) : focused === container ? null : focused;
+      return {
+        role: container.getAttribute("role") ?? "",
+        label: clean(container.getAttribute("aria-label") || lookUp(container.getAttribute("aria-labelledby"))),
+        activeItem: clean(activeItem?.textContent),
+      };
+    }, textCap)
+    .catch(() => null);
+}
+
 // Some sites (nsf.gov among them) first serve a blank, untitled page that runs a script
 // and then reloads into the real one. Reading elements during that blank phase offers
 // Jev nothing but scroll/back/done, and settle() would call the empty DOM "stable".
@@ -934,6 +969,19 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
     // "typed" (a fill happened but the page did not change) and "no_change"
     // (nothing observable happened) both make a repeat proposal redundant.
     let lastRedundant: "typed" | "no_change" | null = null;
+    // The stuck watcher may press Escape in place of stopping, once per run:
+    // a second stuck signal after that means Escape did not help.
+    let escapeRecoveryUsed = false;
+    // Menu text is page text: credential runs scrub it like element labels.
+    const readFocusedMenu = async (): Promise<FocusedMenu | null> => {
+      const focused = await focusedMenu(page, captureCaps.label);
+      if (!focused || !redactor) return focused;
+      return {
+        role: focused.role,
+        label: redactor.redactCapped(focused.label, CREDENTIAL_VISIBLE.label),
+        activeItem: redactor.redactCapped(focused.activeItem, CREDENTIAL_VISIBLE.label),
+      };
+    };
     const history: Array<{ step: number; action: string; outcome: string }> = [];
 
     for (let step = 1; step <= maxSteps; step++) {
@@ -990,7 +1038,9 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
         no_interactive_elements: elements.length === 0,
         history,
       };
-      const answers = await askJev(budget, state, stepQuestions(buildCriteria(elements)));
+      const focusedBefore = await readFocusedMenu();
+      const keyActions = buildKeyActions(focusedBefore);
+      const answers = await askJev(budget, state, stepQuestions(buildCriteria(elements, keyActions)));
       const actionAnswer = answers.action as Extract<JevAnswer, { type: "choice" }>;
       const proposed: string = actionAnswer.choice;
       const probabilities: Record<string, number> = actionAnswer.probabilities ?? {};
@@ -1016,10 +1066,19 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
         status = "goal_achieved";
         break;
       }
+      // A menu opened by mistake can cover the page and make every other
+      // action fail. When that is the likely cause (a menu holds focus),
+      // close it with Escape once before giving up.
+      let stuckRecovery = false;
       if ((answers.stuck as Extract<JevAnswer, { type: "noul" }>).noul > 0.85 && step > 2) {
-        steps.push({ ...base, executed_action: null, detail: "stuck watcher fired; proposed action not executed", outcome: "stuck watcher fired before acting" });
-        status = "stuck";
-        break;
+        if (keyActions.press_escape && !escapeRecoveryUsed) {
+          stuckRecovery = true;
+          escapeRecoveryUsed = true;
+        } else {
+          steps.push({ ...base, executed_action: null, detail: "stuck watcher fired; proposed action not executed", outcome: "stuck watcher fired before acting" });
+          status = "stuck";
+          break;
+        }
       }
 
       // Repeat-no-op recovery: switch to the next-best option from the
@@ -1027,7 +1086,10 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
       // across similar elements is usually several acceptable alternatives.
       let chosen = proposed;
       let recoveryReason: string | undefined;
-      if (lastExecuted === proposed && lastRedundant !== null) {
+      if (stuckRecovery) {
+        chosen = "press_escape";
+        recoveryReason = "stuck watcher fired while a menu had focus; pressed Escape to close it instead of stopping";
+      } else if (lastExecuted === proposed && lastRedundant !== null) {
         // "done" is excluded like "back": an alternate with any positive
         // probability is too weak a basis to terminate the run. Termination
         // stays with the model's own proposal and the goal/stuck watchers.
@@ -1061,6 +1123,16 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
             chosen === "scroll_down" ? 1 : -1,
           );
           detail = chosen;
+        } else if (Object.hasOwn(MENU_KEYS, chosen)) {
+          // Focus can move while Jev decides. Check again right before the
+          // press, so Enter can never land on a form field outside the menu.
+          const focusedNow = await readFocusedMenu();
+          if (!focusedNow) {
+            actionError = "focus is no longer inside a menu; no key was pressed";
+          } else {
+            await page.keyboard.press(MENU_KEYS[chosen]);
+            detail = `pressed ${MENU_KEYS[chosen]} in the focused ${focusedNow.role}`;
+          }
         } else if (!element) {
           actionError = `unknown action ${chosen}`;
         } else if (chosen.startsWith("type_")) {
@@ -1209,6 +1281,11 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
       }
 
       const after = await pageObservables(page, bounded, excerptCap);
+      // An arrow key changes only which item is highlighted. Report that as
+      // an effect, or a second press_down reads as a no-op and repeat
+      // recovery switches away from it.
+      const focusedAfter = Object.hasOwn(MENU_KEYS, chosen) && !actionError ? await readFocusedMenu() : null;
+      const highlightMoved = focusedAfter !== null && focusedAfter.activeItem !== "" && focusedAfter.activeItem !== focusedBefore?.activeItem;
       // Execution failures are attributed to the action, not to ambient page
       // changes that happened to occur in the same window.
       const pageUnchanged =
@@ -1216,7 +1293,8 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
         after.url === observables.url &&
         after.title === observables.title &&
         Math.abs(after.textLength - observables.textLength) <= 50 &&
-        Math.abs(after.scrollY - observables.scrollY) <= 40;
+        Math.abs(after.scrollY - observables.scrollY) <= 40 &&
+        !highlightMoved;
       const outcome = actionError
         ? "action failed"
         : after.url !== observables.url
@@ -1227,7 +1305,9 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
               ? "page content changed"
               : Math.abs(after.scrollY - observables.scrollY) > 40
                 ? "scrolled"
-                : typedIntoLabel !== null
+                : highlightMoved
+                  ? `highlighted "${focusedAfter.activeItem}"`
+                  : typedIntoLabel !== null
                   ? // A fill is a real effect even when nothing navigates: the
                     // field now holds text. Say so, or the stuck watcher
                     // misreads a successful type as a no-op.
