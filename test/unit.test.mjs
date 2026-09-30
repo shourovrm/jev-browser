@@ -100,10 +100,12 @@ async function runMenuScenario(t, pageHtml, labelsToClick, scripts = {}) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => server.closeAllConnections?.() ?? server.close());
   const offeredPerStep = [];
+  const statesPerStep = [];
   const transport = {
     name: "fixture",
     async ask({ state, questions }) {
       const parsed = typeof state === "string" ? JSON.parse(state) : state;
+      statesPerStep.push(parsed);
       offeredPerStep.push(parsed.interactive_elements.map((element) => element.description));
       const answers = {};
       for (const [id, question] of Object.entries(questions)) {
@@ -128,7 +130,7 @@ async function runMenuScenario(t, pageHtml, labelsToClick, scripts = {}) {
     maxSeconds: 30,
     screenshot: "none",
   });
-  return { offeredPerStep, result };
+  return { offeredPerStep, statesPerStep, result };
 }
 
 test("a menu whose script loads late still opens: jev-browser waits and clicks again", async (t) => {
@@ -232,6 +234,98 @@ test("the first click waits for the page's load event, so late scripts have atta
   const listboxScript = `document.getElementById("espresso").addEventListener("click", () => { location.href = "/espresso"; });`;
   const { result } = await runMenuScenario(t, pageHtml, ["Espresso"], { "/listbox.js": { body: listboxScript, delayMs: 2500 } });
   assert.match(result.final_url, /\/espresso$/);
+});
+
+// Web components for the shadow DOM tests: <open-card> holds a button and a
+// link in an open root, <outer-panel> nests <open-card>-like content two roots
+// deep, and <closed-card> hides its link in a closed root.
+const shadowComponents = `<script>
+  customElements.define("open-card", class extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({ mode: "open" }).innerHTML =
+        '<span id="caption">Order a coffee</span><button aria-labelledby="caption" onclick="location.href=\\'/ordered\\'"></button><a href="/menu">Full menu</a>';
+    }
+  });
+  customElements.define("inner-panel", class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: "open" }).innerHTML = '<a href="/hours">Opening hours</a>'; }
+  });
+  customElements.define("outer-panel", class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: "open" }).innerHTML = '<p>Visit us</p><inner-panel></inner-panel>'; }
+  });
+  customElements.define("slot-button", class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: "open" }).innerHTML = '<button onclick="location.href=\\'/booked\\'"><slot></slot></button>'; }
+  });
+  customElements.define("promo-dialog", class extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({ mode: "open" }).innerHTML =
+        '<div role="dialog" aria-modal="true"><h2>Big news</h2><slot></slot><style>h2 { margin: 0 }</style></div>';
+    }
+  });
+  customElements.define("closed-card", class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: "closed" }).innerHTML = '<a href="/secret">Hidden offer</a>'; }
+  });
+</script>`;
+
+test("controls inside an open shadow root are offered, labelled from their own root, and clickable", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Welcome</p><open-card></open-card>${shadowComponents}`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, ["Order a coffee"]);
+  assert.ok(offeredPerStep[0].includes('button "Order a coffee"'), "the button should be offered with its aria-labelledby name");
+  assert.ok(offeredPerStep[0].some((description) => description.startsWith('a "Full menu"')), "the link should be offered");
+  assert.match(result.final_url, /\/ordered$/);
+});
+
+test("controls in a shadow root nested inside another shadow root are offered", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Welcome</p><outer-panel></outer-panel>${shadowComponents}`;
+  const { offeredPerStep } = await runMenuScenario(t, pageHtml, []);
+  assert.ok(offeredPerStep[0].some((description) => description.startsWith('a "Opening hours"')));
+});
+
+test("a shadow control labelled through a slot takes the slotted text as its name", async (t) => {
+  // Like Shoelace's <sl-button>: the inner <button> holds only a <slot>, so
+  // its own innerText and textContent are empty.
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Welcome</p><slot-button>Book a table</slot-button>${shadowComponents}`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, ["Book a table"]);
+  assert.ok(offeredPerStep[0].includes('button "Book a table"'));
+  assert.match(result.final_url, /\/booked$/);
+});
+
+test("the first step waits for custom elements that are defined after the load event", async (t) => {
+  // Like Shoelace's autoloader: components are defined a moment after load.
+  const lateDefinition = shadowComponents.replace("<script>", "<script>setTimeout(() => {").replace("</script>", "}, 1500)</script>");
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Welcome</p><slot-button>Book a table</slot-button>${lateDefinition}`;
+  const { offeredPerStep } = await runMenuScenario(t, pageHtml, []);
+  assert.ok(offeredPerStep[0].includes('button "Book a table"'));
+});
+
+test("a modal dialog inside a shadow root is the judged excerpt, slotted text included", async (t) => {
+  // Like Shoelace's <sl-dialog>: the aria-modal element is in the shadow root
+  // and the message is light-DOM content shown through a slot.
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Welcome to the cafe</p>
+    <promo-dialog><p>We moved to a new address</p><button>No, thanks</button></promo-dialog>${shadowComponents}`;
+  const { statesPerStep } = await runMenuScenario(t, pageHtml, []);
+  const excerpt = statesPerStep[0].page_text_excerpt;
+  assert.match(excerpt, /Big news/);
+  assert.match(excerpt, /We moved to a new address/);
+  assert.doesNotMatch(excerpt, /Welcome to the cafe|margin/);
+});
+
+test("controls in a closed shadow root are not offered and the run does not error", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Welcome</p><a href="/about">About us</a><closed-card></closed-card>${shadowComponents}`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, []);
+  assert.equal(result.status, "done");
+  assert.ok(offeredPerStep[0].some((description) => description.startsWith('a "About us"')));
+  assert.ok(!offeredPerStep[0].some((description) => description.includes("Hidden offer")));
+});
+
+test("a page rendered entirely inside a component still counts as content", async (t) => {
+  // No light-DOM text or controls at all: waitForFirstContent and settle must
+  // see the component's controls, or the run waits out its full timeout.
+  const pageHtml = `<!doctype html><title>App</title><open-card></open-card>${shadowComponents}`;
+  const { result } = await runMenuScenario(t, pageHtml, []);
+  assert.equal(result.status, "done");
+  assert.ok(result.elapsed_ms < 8_000, `run took ${result.elapsed_ms} ms`);
 });
 
 test("resolvePrivateTransport: other providers are left as they are", () => {

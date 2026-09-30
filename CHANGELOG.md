@@ -2,6 +2,7 @@
 
 ## Unreleased (local)
 
+- Shadow DOM: controls inside open shadow roots, nested ones included, are offered and clicked; labels resolve inside their own root and through `<slot>` content; a modal dialog in a shadow root is the judged excerpt; the first step waits (bounded, 4 s) for custom elements defined after load. Closed roots stay unreachable.
 - After each page load, waits (bounded, 5 s) for the page's `load` event, so async scripts have attached their click handlers before the first action.
 - Menu items, list options, tabs and non-input comboboxes are offered by ARIA role even when they are plain `li` or `div` elements; their description names the role and whether the item is selected.
 - Drop-down menus: toggles are described as menus (open/closed); a closed one is opened by hover, then click, then a click after the page finishes loading.

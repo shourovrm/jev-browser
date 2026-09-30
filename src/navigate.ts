@@ -264,26 +264,43 @@ export interface CaptureCaps {
 // labels capped at 80 (the noise-name threshold), hrefs and option labels
 // uncapped in practice.
 const DEFAULT_CAPTURE_CAPS: CaptureCaps = { label: 80, option: 1_000_000, href: 1_000_000 };
+
+// Every scan of the page goes through a Playwright locator rather than
+// document.querySelectorAll: Playwright's CSS engine also searches open shadow
+// roots, nested ones included, so controls inside web components are found.
+// Closed shadow roots stay out of reach, as they are for any page script.
+// Menu items, list options and tabs are often plain <li> or <div> elements
+// that carry only an ARIA role; without these roles an open menu or
+// autocomplete list offers Jev nothing to pick.
+const CANDIDATE_SELECTOR =
+  'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="searchbox"], [role="textbox"], ' +
+  '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="tab"], [role="combobox"]';
+const NATIVE_CONTROL_SELECTOR = "a, button, input, select, textarea";
+
 async function extractAndStamp(
   page: Page,
   bounded: (cap: number) => number,
   caps: CaptureCaps = DEFAULT_CAPTURE_CAPS,
   includePasswordInputs = false,
 ): Promise<RawElement[]> {
-  return page.evaluate(
-    ({ cap, includePw }: { cap: CaptureCaps; includePw: boolean }) => {
-      // Clear stamps from previous steps first: elements that dropped out of
-      // the candidate list keep their old data-jev-id, which would make
-      // selectors match more than one element.
-      document.querySelectorAll("[data-jev-id]").forEach((el) => el.removeAttribute("data-jev-id"));
-      // Menu items, list options and tabs are often plain <li> or <div>
-      // elements that carry only an ARIA role; without these roles an open
-      // menu or autocomplete list offers Jev nothing to pick.
-      const SEL =
-        'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="searchbox"], [role="textbox"], ' +
-        '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="tab"], [role="combobox"]';
+  // Clear stamps from previous steps first: elements that dropped out of the
+  // candidate list keep their old data-jev-id, which would make selectors
+  // match more than one element.
+  await page.locator("[data-jev-id]").evaluateAll((stamped) => stamped.forEach((el) => el.removeAttribute("data-jev-id")));
+  return page.locator(CANDIDATE_SELECTOR).evaluateAll(
+    (candidates, { cap, includePw }: { cap: CaptureCaps; includePw: boolean }) => {
+      // Text as rendered through <slot> elements. A web component's inner
+      // control often holds only a <slot>, so its own innerText and
+      // textContent are empty and the label lives in the host's light DOM.
+      // assignedNodes({ flatten: true }) also returns a slot's fallback
+      // content when nothing is assigned to it.
+      const slottedText = (node: Node): string => {
+        if (node instanceof HTMLSlotElement) return node.assignedNodes({ flatten: true }).map(slottedText).join(" ");
+        if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+        return Array.from(node.childNodes).map(slottedText).join(" ");
+      };
       const out: any[] = [];
-      for (const el of document.querySelectorAll(SEL) as NodeListOf<HTMLElement>) {
+      for (const el of candidates as HTMLElement[]) {
         // Cap accepted candidates AFTER filtering so hidden boilerplate at the
         // top of the DOM cannot crowd out usable controls below it.
         if (out.length >= 2000) break;
@@ -305,7 +322,9 @@ async function extractAndStamp(
         const labelledby = norm(
           (el.getAttribute("aria-labelledby") ?? "")
             .split(/\s+/)
-            .map((ref) => document.getElementById(ref)?.textContent ?? "")
+            // Ids are scoped to their shadow root, so look the reference up
+            // in the control's own root, not the document.
+            .map((ref) => (el.getRootNode() as Document | ShadowRoot).getElementById(ref)?.textContent ?? "")
             .join(" "),
         );
         const nativeLabels = norm(
@@ -345,6 +364,7 @@ async function extractAndStamp(
             norm(el.getAttribute("title")) ||
             norm(el.innerText) ||
             norm(el.textContent) ||
+            norm(slottedText(el)) ||
             "",
         );
         const href = tag === "a" ? (el.getAttribute("href") || "").slice(0, cap.href) : "";
@@ -409,11 +429,42 @@ interface Observables {
   visibleExcerpt: string;
 }
 
+/**
+ * The text of the innermost open modal dialog in document order, or null when
+ * none is open. Found through a locator so a modal inside a web component's
+ * shadow root counts too (Shoelace's <sl-dialog> is one).
+ */
+async function openModalText(page: Page, cap: number): Promise<string | null> {
+  return page
+    .locator('[aria-modal="true"], dialog:modal')
+    .evaluateAll((candidates, cap) => {
+      const clean = (s: string | null | undefined) => (s ?? "").replace(/\s+/g, " ").trim();
+      const shown = (el: Element) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
+      // innerText leaves out content shown through <slot> elements, which is
+      // where a component dialog's message usually is, so a modal inside a
+      // shadow root is read along the flat tree instead: slots give their
+      // assigned nodes, hosts give their shadow root.
+      const flatTreeText = (node: Node): string => {
+        if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+        if (node instanceof Element && ["STYLE", "SCRIPT", "TEMPLATE"].includes(node.tagName)) return "";
+        if (node instanceof HTMLSlotElement) return node.assignedNodes({ flatten: true }).map(flatTreeText).join(" ");
+        const children = node instanceof Element && node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes;
+        return Array.from(children).map(flatTreeText).join(" ");
+      };
+      const modal = (candidates as HTMLElement[]).filter(shown).at(-1);
+      if (!modal) return null;
+      const text = modal.getRootNode() instanceof ShadowRoot ? flatTreeText(modal) : modal.innerText;
+      return clean(text).slice(0, cap);
+    }, cap)
+    .catch(() => null);
+}
+
 async function pageObservables(page: Page, bounded: (cap: number) => number, excerptCap = 1500): Promise<Observables> {
   const url = page.url();
   const title = await page.title().catch(() => "");
+  const modalText = await openModalText(page, excerptCap);
   const data = await page
-    .evaluate((cap: number) => ({
+    .evaluate(({ cap, modalText }: { cap: number; modalText: string | null }) => ({
       length: document.body?.innerText?.length ?? 0,
       scrollY: window.scrollY,
       excerpt: (document.body?.innerText ?? "").replace(/\s+/g, " ").slice(0, cap),
@@ -426,8 +477,7 @@ async function pageObservables(page: Page, bounded: (cap: number) => number, exc
       visibleExcerpt: (() => {
         const clean = (s: string | null | undefined) => (s ?? "").replace(/\s+/g, " ").trim();
         const shown = (el: Element) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
-        const modal = [...document.querySelectorAll<HTMLElement>('[aria-modal="true"], dialog:modal')].filter(shown).at(-1);
-        if (modal) return clean(modal.innerText).slice(0, cap);
+        if (modalText !== null) return modalText;
         const parts: string[] = [];
         let length = 0;
         let visited = 0;
@@ -450,23 +500,28 @@ async function pageObservables(page: Page, bounded: (cap: number) => number, exc
         // never the unseen start of the body that this feature exists to stop.
         return parts.join(" ").slice(0, cap);
       })(),
-    }), excerptCap)
+    }), { cap: excerptCap, modalText })
     .catch(() => ({ length: 0, scrollY: 0, excerpt: "", visibleExcerpt: "" }));
   return { url, title, textLength: data.length, scrollY: data.scrollY, excerpt: data.excerpt, visibleExcerpt: data.visibleExcerpt };
 }
 
 /** What a menu toggle shows right now: its aria-expanded value and how many controls are visible. */
 async function menuSnapshot(page: Page, selector: string) {
-  return page
-    .evaluate((toggleSelector) => {
-      const toggle = document.querySelector(toggleSelector);
-      const visibleControls = Array.from(document.querySelectorAll("a, button, input, select, textarea, [role=menuitem], [role=option]")).filter((control) => {
-        const box = control.getBoundingClientRect();
-        return box.width > 0 && box.height > 0 && getComputedStyle(control).visibility !== "hidden";
-      }).length;
-      return { expanded: toggle?.getAttribute("aria-expanded") ?? null, visibleControls };
-    }, selector)
-    .catch(() => ({ expanded: null, visibleControls: 0 }));
+  const expanded = await page
+    .locator(selector)
+    .getAttribute("aria-expanded", { timeout: 1_000 })
+    .catch(() => null);
+  const visibleControls = await page
+    .locator(`${NATIVE_CONTROL_SELECTOR}, [role=menuitem], [role=option]`)
+    .evaluateAll(
+      (controls) =>
+        controls.filter((control) => {
+          const box = control.getBoundingClientRect();
+          return box.width > 0 && box.height > 0 && getComputedStyle(control).visibility !== "hidden";
+        }).length,
+    )
+    .catch(() => 0);
+  return { expanded, visibleControls };
 }
 
 function menuOpened(before: { visibleControls: number }, after: { expanded: string | null; visibleControls: number }) {
@@ -503,16 +558,24 @@ async function openMenu(page: Page, selector: string, bounded: (cap: number) => 
 async function waitForFirstContent(page: Page, bounded: (cap: number) => number) {
   const deadline = performance.now() + bounded(12_000);
   while (performance.now() < deadline) {
-    const hasContent = await page
-      .evaluate(
-        () =>
-          (document.body?.innerText?.trim().length ?? 0) > 0 ||
-          document.querySelectorAll("a,button,input,select,textarea").length > 0,
-      )
-      .catch(() => false); // evaluate throws while the page is navigating away
+    // evaluate and count throw while the page is navigating away
+    const hasText = await page.evaluate(() => (document.body?.innerText?.trim().length ?? 0) > 0).catch(() => false);
+    const hasContent = hasText || (await page.locator(NATIVE_CONTROL_SELECTOR).count().catch(() => 0)) > 0;
     if (hasContent) return;
     await page.waitForTimeout(250);
   }
+}
+
+// Component libraries often define their custom elements a moment after the
+// load event (Shoelace's autoloader fetches each component on demand). Until
+// then the elements have no shadow root, so the first step would see none of
+// their controls. Wait, bounded, until no element on the page is undefined.
+// Runs once per run, before the first step: a page that uses custom tags it
+// never defines would otherwise pay this wait on every step.
+async function waitForComponentUpgrades(page: Page, bounded: (cap: number) => number) {
+  await page
+    .waitForFunction(() => document.querySelector(":not(:defined)") === null, undefined, { timeout: bounded(4_000), polling: 100 })
+    .catch(() => {});
 }
 
 async function settle(page: Page, bounded: (cap: number) => number) {
@@ -528,12 +591,9 @@ async function settle(page: Page, bounded: (cap: number) => number) {
   const deadline = performance.now() + bounded(1_500);
   let prev: string | null = null;
   while (performance.now() < deadline) {
-    const fingerprint = await page
-      .evaluate(
-        () =>
-          `${document.body?.innerText?.length ?? 0}:${document.querySelectorAll("a,button,input,select,textarea").length}`,
-      )
-      .catch(() => null);
+    const textLength = await page.evaluate(() => document.body?.innerText?.length ?? 0).catch(() => null);
+    const controlCount = await page.locator(NATIVE_CONTROL_SELECTOR).count().catch(() => null);
+    const fingerprint = textLength === null || controlCount === null ? null : `${textLength}:${controlCount}`;
     if (fingerprint !== null && fingerprint === prev) return; // DOM went quiet
     prev = fingerprint;
     await page.waitForTimeout(250);
@@ -788,6 +848,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
       await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: bounded(30_000) });
       await waitForFirstContent(page, bounded);
       await settle(page, bounded);
+      await waitForComponentUpgrades(page, bounded);
     }
 
     // Bot-protection interstitials are walls, not pages to reason about. The
