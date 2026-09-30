@@ -21,6 +21,7 @@ export interface RawElement {
   options?: SelectOption[]; // options for selects, with their DOM index
   menu?: "open" | "closed"; // a menu toggle (aria-expanded / aria-haspopup) and its current state
   selected?: boolean; // aria-selected or aria-checked is "true": the option, tab or menu item is chosen
+  behindModal?: boolean; // a modal dialog is open and this control is outside it, so clicks cannot reach it
 }
 
 /** One native <select> option: its DOM index and (scrubbed) label. */
@@ -138,13 +139,16 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
     const id = `e${elements.length + 1}`;
     const label = el.text.slice(0, 60);
     const hrefTail = el.href ? ` -> ${el.href.replace(/^https?:\/\//, "").slice(0, 70)}` : "";
+    // An open modal intercepts every click outside it. Without this note Jev
+    // keeps picking the control it wants and the click times out each step.
+    const blockedNote = el.behindModal ? " (behind an open dialog; close it first)" : "";
     elements.push({
       id,
       attr: el.attr,
       kind,
       submitVia: kind === "submit" ? "click" : undefined,
       description:
-        kind === "search"
+        (kind === "search"
           ? `${el.tag} "${label}" (type into this search box and run the search)`
           : kind === "submit"
             ? `${el.tag} "${label}" (submit the form now)`
@@ -152,7 +156,7 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
               ? `${el.tag} "${label}" (type without submitting)`
               : kind === "select"
                 ? `${el.tag} "${label}" (dropdown; a follow-up picks the option)`
-                : `${el.tag} "${label}"${hrefTail}${roleNote(el.role, el.selected)}${menuNote(el.menu)}`,
+                : `${el.tag} "${label}"${hrefTail}${roleNote(el.role, el.selected)}${menuNote(el.menu)}`) + blockedNote,
       options: kind === "select" ? (el.options ?? []) : undefined,
       menu: kind === "click" ? el.menu : undefined,
     });
@@ -166,7 +170,7 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
         attr: el.attr,
         kind: "submit",
         submitVia: "enter",
-        description: `${el.tag} "${label}" (submit the form now)`,
+        description: `${el.tag} "${label}" (submit the form now)${blockedNote}`,
       });
     }
   }

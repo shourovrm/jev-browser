@@ -3,7 +3,7 @@
 // execution, the deadline is a real AbortSignal threaded through Jev, the
 // typing generator, and every Playwright timeout, usage is per-run, and the
 // final payload/screenshot extraction is best-effort.
-import { chromium, type Browser, type BrowserContext, type ConsoleMessage, type Page, type Request, type Response } from "playwright";
+import { chromium, type Browser, type BrowserContext, type ConsoleMessage, type ElementHandle, type Page, type Request, type Response } from "playwright";
 import { generateText } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
@@ -276,6 +276,21 @@ const CANDIDATE_SELECTOR =
   'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="searchbox"], [role="textbox"], ' +
   '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="tab"], [role="combobox"]';
 const NATIVE_CONTROL_SELECTOR = "a, button, input, select, textarea";
+const MODAL_SELECTOR = '[aria-modal="true"], dialog:modal';
+
+/** The innermost open modal dialog in document order, shadow roots included, or null. */
+async function openModalHandle(page: Page): Promise<ElementHandle<Node> | null> {
+  const modals = await page.locator(MODAL_SELECTOR).elementHandles().catch(() => []);
+  const shownIndex = await page
+    .evaluate(
+      (candidates) =>
+        (candidates as Element[]).map((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden").lastIndexOf(true),
+      modals,
+    )
+    .catch(() => -1);
+  for (const [index, modal] of modals.entries()) if (index !== shownIndex) await modal.dispose();
+  return modals[shownIndex] ?? null;
+}
 
 async function extractAndStamp(
   page: Page,
@@ -287,8 +302,20 @@ async function extractAndStamp(
   // candidate list keep their old data-jev-id, which would make selectors
   // match more than one element.
   await page.locator("[data-jev-id]").evaluateAll((stamped) => stamped.forEach((el) => el.removeAttribute("data-jev-id")));
+  const modal = await openModalHandle(page);
+  try {
+    return await scanCandidates(page, caps, includePasswordInputs, modal);
+  } finally {
+    await modal?.dispose();
+  }
+}
+
+async function scanCandidates(page: Page, caps: CaptureCaps, includePasswordInputs: boolean, modal: ElementHandle<Node> | null): Promise<RawElement[]> {
   return page.locator(CANDIDATE_SELECTOR).evaluateAll(
-    (candidates, { cap, includePw }: { cap: CaptureCaps; includePw: boolean }) => {
+    // The modal arrives as a live element; it is typed unknown here because
+    // Playwright's handle-unboxing types recurse too deeply over Element.
+    (candidates, { cap, includePw, modal: modalArgument }: { cap: CaptureCaps; includePw: boolean; modal: unknown }) => {
+      const modal = modalArgument as Element | null;
       // Text as rendered through <slot> elements. A web component's inner
       // control often holds only a <slot>, so its own innerText and
       // textContent are empty and the label lives in the host's light DOM.
@@ -298,6 +325,15 @@ async function extractAndStamp(
         if (node instanceof HTMLSlotElement) return node.assignedNodes({ flatten: true }).map(slottedText).join(" ");
         if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
         return Array.from(node.childNodes).map(slottedText).join(" ");
+      };
+      // Walks the flat tree upward: a slotted element goes to its slot, a
+      // shadow root to its host. Plain contains() stops at shadow
+      // boundaries, and a component dialog's buttons are usually slotted.
+      const insideModal = (el: Element): boolean => {
+        for (let node: Node | null = el; node; node = (node as Element).assignedSlot ?? node.parentNode ?? (node as ShadowRoot).host ?? null) {
+          if (node === modal) return true;
+        }
+        return false;
       };
       const out: any[] = [];
       for (const el of candidates as HTMLElement[]) {
@@ -412,11 +448,11 @@ async function extractAndStamp(
                 .filter((o) => o.label.length > 0)
                 .slice(0, 200)
             : undefined;
-        out.push({ attr, tag, role: roleAttr || tag, text: label.slice(0, cap.label), href, typeAttr, clickable, typeable, searchField, submitControl, enterSubmittable, selectable, passwordInput: passwordInput || undefined, options, menu, selected: selected || undefined });
+        out.push({ attr, tag, role: roleAttr || tag, text: label.slice(0, cap.label), href, typeAttr, clickable, typeable, searchField, submitControl, enterSubmittable, selectable, passwordInput: passwordInput || undefined, options, menu, selected: selected || undefined, behindModal: (modal !== null && !insideModal(el)) || undefined });
       }
       return out;
     },
-    { cap: caps, includePw: includePasswordInputs },
+    { cap: caps, includePw: includePasswordInputs, modal },
   );
 }
 
@@ -436,7 +472,7 @@ interface Observables {
  */
 async function openModalText(page: Page, cap: number): Promise<string | null> {
   return page
-    .locator('[aria-modal="true"], dialog:modal')
+    .locator(MODAL_SELECTOR)
     .evaluateAll((candidates, cap) => {
       const clean = (s: string | null | undefined) => (s ?? "").replace(/\s+/g, " ").trim();
       const shown = (el: Element) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";

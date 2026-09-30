@@ -311,6 +311,38 @@ test("a modal dialog inside a shadow root is the judged excerpt, slotted text in
   assert.doesNotMatch(excerpt, /Welcome to the cafe|margin/);
 });
 
+test("buildActionSpace marks controls that sit behind an open modal dialog", () => {
+  const { elements } = buildActionSpace([
+    el({ attr: "j1", tag: "button", text: "Open Dialog", href: "", behindModal: true }),
+    el({ attr: "j2", tag: "button", text: "No, thanks", href: "" }),
+  ]);
+  assert.equal(elements[0].description, 'button "Open Dialog" (behind an open dialog; close it first)');
+  assert.equal(elements[1].description, 'button "No, thanks"');
+});
+
+test("controls outside a native modal dialog are marked as behind it", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><a href="/menu">Full menu</a>
+    <dialog id="d"><p>Accept cookies?</p><button>Accept</button></dialog><script>document.getElementById("d").showModal()</script>`;
+  const { offeredPerStep } = await runMenuScenario(t, pageHtml, []);
+  assert.ok(offeredPerStep[0].some((description) => description.startsWith('a "Full menu"') && description.endsWith("(behind an open dialog; close it first)")));
+  assert.ok(offeredPerStep[0].includes('button "Accept"'));
+});
+
+test("slotted controls of a modal inside a shadow root are not marked; the page behind it is", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Welcome</p><slot-button>Book a table</slot-button>
+    <promo-dialog><p>We moved to a new address</p><button>No, thanks</button></promo-dialog>${shadowComponents}`;
+  const { offeredPerStep } = await runMenuScenario(t, pageHtml, []);
+  assert.ok(offeredPerStep[0].includes('button "No, thanks"'));
+  assert.ok(offeredPerStep[0].includes('button "Book a table" (behind an open dialog; close it first)'));
+});
+
+test("with no modal open, nothing is marked as behind one", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><a href="/menu">Full menu</a><dialog id="d"><button>Accept</button></dialog>
+    <script>document.getElementById("d").show()</script>`;
+  const { offeredPerStep } = await runMenuScenario(t, pageHtml, []);
+  assert.ok(!offeredPerStep[0].some((description) => description.includes("behind an open dialog")));
+});
+
 test("controls in a closed shadow root are not offered and the run does not error", async (t) => {
   const pageHtml = `<!doctype html><title>Cafe</title><p>Welcome</p><a href="/about">About us</a><closed-card></closed-card>${shadowComponents}`;
   const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, []);
