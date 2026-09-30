@@ -441,6 +441,8 @@ async function scanCandidates(page: Page, caps: CaptureCaps, includePasswordInpu
         if (clickable && expandedAttr === "true") menu = "open";
         else if (clickable && (expandedAttr === "false" || (popupAttr !== null && popupAttr !== "false"))) menu = "closed";
         const selected = el.getAttribute("aria-selected") === "true" || el.getAttribute("aria-checked") === "true";
+        // typeable already excludes password inputs, so no password value is ever read.
+        const value = typeable && (tag === "input" || tag === "textarea") ? (el as HTMLInputElement).value.slice(0, cap.label) : "";
         const options =
           tag === "select"
             ? Array.from((el as unknown as HTMLSelectElement).options)
@@ -451,7 +453,7 @@ async function scanCandidates(page: Page, caps: CaptureCaps, includePasswordInpu
                 .filter((o) => o.label.length > 0)
                 .slice(0, 200)
             : undefined;
-        out.push({ attr, tag, role: roleAttr || tag, text: label.slice(0, cap.label), href, typeAttr, clickable, typeable, searchField, submitControl, enterSubmittable, selectable, passwordInput: passwordInput || undefined, options, menu, selected: selected || undefined, behindModal: (modal !== null && !insideModal(el)) || undefined });
+        out.push({ attr, tag, role: roleAttr || tag, text: label.slice(0, cap.label), href, typeAttr, clickable, typeable, searchField, submitControl, enterSubmittable, selectable, passwordInput: passwordInput || undefined, options, menu, selected: selected || undefined, value: value || undefined, behindModal: (modal !== null && !insideModal(el)) || undefined });
       }
       return out;
     },
@@ -1018,6 +1020,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
         for (const el of raw) {
           el.text = redactor.redactCapped(el.text, CREDENTIAL_VISIBLE.label);
           el.href = redactor.redactCapped(el.href, CREDENTIAL_VISIBLE.href);
+          if (el.value) el.value = redactor.redactCapped(el.value, CREDENTIAL_VISIBLE.label);
           if (el.options) el.options = el.options.map((o) => ({ i: o.i, label: redactor.redactCapped(o.label, CREDENTIAL_VISIBLE.option) }));
         }
       }

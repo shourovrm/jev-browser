@@ -2,6 +2,7 @@
 
 ## Unreleased (local)
 
+- Text fields are described with what they currently hold (`input "State" holding "Nevada"`), so Jev can see a finished fill or autocomplete pick; password fields are never read.
 - Keyboard inside menus: with focus in a menu, menubar, listbox or combobox, Jev can press Down, Up, Enter and Escape (Right and Left in a menubar); highlight moves count as an effect; the stuck watcher presses Escape once when a menu has focus.
 - While a modal dialog is open (`aria-modal="true"` or a native modal `<dialog>`, shadow roots included), controls outside it are described as behind it, so Jev closes the dialog instead of retrying a click the dialog intercepts.
 - Shadow DOM: controls inside open shadow roots, nested ones included, are offered and clicked; labels resolve inside their own root and through `<slot>` content; a modal dialog in a shadow root is the judged excerpt; the first step waits (bounded, 4 s) for custom elements defined after load. Closed roots stay unreachable.

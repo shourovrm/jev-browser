@@ -477,6 +477,24 @@ test("the stuck watcher still stops the run when no menu has focus", async (t) =
   assert.equal(result.status, "stuck");
 });
 
+test("buildActionSpace shows what a text field already holds", () => {
+  const { elements } = buildActionSpace([
+    el({ attr: "j1", tag: "input", role: "combobox", text: "State", href: "", clickable: false, typeable: true, value: "Nevada" }),
+    el({ attr: "j2", tag: "input", role: "input", text: "Search", href: "", clickable: false, typeable: true, searchField: true, value: "" }),
+  ]);
+  assert.equal(elements[0].description, 'input "State" holding "Nevada" (type without submitting)');
+  assert.equal(elements[1].description, 'input "Search" (type into this search box and run the search)');
+});
+
+test("the scan reads the current value of inputs and textareas, never of password fields", async (t) => {
+  const pageHtml = `<!doctype html><title>Form</title><label>State <input value="Nevada"></label>
+    <label for="notes">Notes</label> <textarea id="notes">Leave at the door</textarea><label>Password <input type="password" value="hunter22"></label>`;
+  const { offeredPerStep } = await runMenuScenario(t, pageHtml, []);
+  assert.ok(offeredPerStep[0].includes('input "State" holding "Nevada" (type without submitting)'));
+  assert.ok(offeredPerStep[0].includes('textarea "Notes" holding "Leave at the door" (type without submitting)'));
+  assert.ok(!offeredPerStep[0].some((description) => description.includes("hunter22")));
+});
+
 test("resolvePrivateTransport: other providers are left as they are", () => {
   const transport = resolvePrivateTransport({ JEV_PROVIDER: "typesafe", TYPESAFE_API_KEY: "ts_test" });
   assert.equal(transport.name, "typesafe");
