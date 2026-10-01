@@ -1,0 +1,14 @@
+{
+  "dataviz": "Make a chart or graph from data: bar, line or pie charts, plots, dashboards, stat tiles, from CSV, spreadsheets or numbers.",
+  "update-config": "Change Claude Code settings.json: hooks, permissions, env vars, automated 'whenever X do Y' behaviours.",
+  "keybindings-help": "Customize Claude Code keyboard shortcuts in ~/.claude/keybindings.json.",
+  "code-review": "Review the current diff, a PR number, or a branch for correctness bugs.",
+  "simplify": "Clean up changed code for reuse, simplicity and efficiency, then apply the fixes.",
+  "fewer-permission-prompts": "Add an allowlist of common read-only commands to cut Claude Code permission prompts.",
+  "loop": "Run a prompt or slash command repeatedly on an interval, or poll for status.",
+  "schedule": "Create or manage scheduled cloud agents that run on a cron schedule or once at a set time.",
+  "claude-api": "Build with the Claude API or Anthropic SDK: model ids, pricing, tool use, caching, streaming.",
+  "run": "Launch and drive this project's app to see a change working, or screenshot it.",
+  "init": "Create a CLAUDE.md file documenting a codebase.",
+  "security-review": "Security review of the pending changes on the current branch."
+}

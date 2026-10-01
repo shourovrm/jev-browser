@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Send a Jev decisions request through OpenRouter.
+#
+# Usage: jev request.json      (or: jev - < request.json)
+# The request JSON needs "questions" and "state"; "model" defaults to typesafe/jev-1.13.
+# The API key is read from ~/.config/jev/openrouter.env and is never printed.
+set -euo pipefail
+
+key_file="${HOME}/.config/jev/openrouter.env"
+endpoint="https://openrouter.ai/api/alpha/decisions"
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: jev <request.json | ->" >&2
+    exit 2
+fi
+
+request_file="$1"
+if [[ "$request_file" == "-" ]]; then
+    request_file="/dev/stdin"
+fi
+
+# shellcheck disable=SC1090
+source "$key_file"
+
+# Only route to providers that neither train on nor retain prompts; if that ever changes,
+# OpenRouter refuses the call instead of quietly sending the text somewhere less private.
+request_body="$(jq '.model //= "typesafe/jev-1.13" | .provider = {"data_collection": "deny", "zdr": true}' "$request_file")"
+
+# The response body is followed by one line with the wall-clock time of the call.
+curl --silent --show-error --fail-with-body \
+    --request POST "$endpoint" \
+    --header "Authorization: Bearer ${OPENROUTER_API_KEY}" \
+    --header "Content-Type: application/json" \
+    --data "$request_body" \
+    --write-out '\nelapsed_seconds: %{time_total}\n'

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# jev-browser CLI with this machine's defaults: Jev via OpenRouter, DeepSeek
+# V4.1 Flash for typing, Helium as the browser. `jev-browser run "<task>" <url>`
+# reuses a warm background Helium (started on first use, stops after 15 idle
+# minutes; `jev-browser stop-browser` stops it now). The key is loaded here so
+# it never has to be written into a config file or typed on the command line.
+set -euo pipefail
+
+set -a
+# shellcheck disable=SC1091
+source "$HOME/.config/jev/openrouter.env"
+set +a
+
+# Other provider keys would win jev-browser's auto-detection, so pin both choices explicitly.
+export JEV_PROVIDER=openrouter
+export JEV_BROWSER_TYPE_PROVIDER=openrouter
+
+exec node "__JEV_BROWSER_DIR__/dist/index.js" "$@"

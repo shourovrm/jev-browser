@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Starts the local jev-browser MCP server (stdio) with this machine's defaults:
+# Jev via OpenRouter, DeepSeek V4.1 Flash for typing, Helium as the browser.
+# The key is loaded here so it never has to be written into ~/.claude.json.
+set -euo pipefail
+
+set -a
+# shellcheck disable=SC1091
+source "$HOME/.config/jev/openrouter.env"
+set +a
+
+# Other provider keys would win jev-browser's auto-detection, so pin both choices explicitly.
+export JEV_PROVIDER=openrouter
+export JEV_BROWSER_TYPE_PROVIDER=openrouter
+
+exec node "__JEV_BROWSER_DIR__/dist/index.js" "$@"

@@ -1,13 +1,62 @@
 # Jev Browser
 
-[![CI](https://github.com/jkudish/jev-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/jkudish/jev-browser/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+This repository is a fork of [jkudish/jev-browser](https://github.com/jkudish/jev-browser) 0.8.1. It adds ARIA menu, option and tab controls, shadow DOM, arrow-key menus, iframes, a warm background browser for the CLI, and a Claude Code setup made of the Jev router, two skills and four helper agents. [ROADMAP.md](ROADMAP.md) describes each addition with its live-check results, and [CHANGELOG.md](CHANGELOG.md) lists them under "Unreleased (local)".
 
 <p align="center">
   <img src=".github/jev-browser-banner.png" alt="jev-browser — Fast and cheap browser use using TypeSafe's Jev model" />
 </p>
 
 Fast and very cheap browser use using TypeSafe's Jev model.
+
+## Setup for coding agents
+
+A coding agent can install everything in this section without help, except the API key, which the user supplies. The steps install jev-browser, its CLI and MCP wrappers, the Jev router (a `UserPromptSubmit` hook that sizes each Claude Code prompt and suggests a helper agent and a skill), the `jev-browser` and `use-jev` skills, and the four helper agents the router hands work to.
+
+**Requirements.** The machine needs Linux or macOS, Node.js 22 or newer, `git`, `python3`, `jq` and `curl`. The browser is Helium at `/usr/bin/helium-browser` when it is installed; without it, jev-browser uses Playwright's Chromium, which `npx playwright install chromium` downloads (ask the user before downloading a browser). Jev calls go through OpenRouter, so the user needs an OpenRouter API key with access to `typesafe/jev-1.13`.
+
+**Steps for the agent.**
+
+1. Clone and build:
+   ```bash
+   git clone https://github.com/shourovrm/jev-browser.git ~/repos/jev-browser
+   cd ~/repos/jev-browser && npm ci && npm run build
+   ```
+2. Install the Claude Code setup, which is safe to run again after a `git pull`:
+   ```bash
+   agent-setup/install.sh
+   ```
+3. Ask the user to put their key into `~/.config/jev/openrouter.env` as `OPENROUTER_API_KEY=...`. The installer creates that file with mode 600 when it is missing. Never print, echo, log or commit the key, and never ask the user to paste it into the chat: they edit the file themselves.
+4. Check that `~/.local/bin` is on `PATH` (`command -v jev-browser`); if it is not, tell the user which shell profile line adds it.
+5. Verify the browser agent. The command prints a JSON result; `status` is `done`, `goal_achieved` or `max_steps` when everything works, and the first run takes about 7 s longer because it starts the background browser:
+   ```bash
+   jev-browser run "Open the Learn more link" https://example.com --no-screenshot --max-steps 3
+   ```
+6. Verify the router. It prints the size Jev picks (tiny, everyday, large or hardest), the helper agent, and a skill or `none_of_these`:
+   ```bash
+   jev-router try "rename the variable user_count to member_count"
+   ```
+7. Optionally register the MCP server for clients that cannot run shell commands; the `jev-browser` skill tells agents to use the CLI first:
+   ```bash
+   claude mcp add --scope user jev-browser -- ~/.local/bin/jev-browser-mcp
+   ```
+8. Tell the user that the router is off in every session until they switch it on, by typing `! jev-router on all` in that Claude Code session (`jev-router off` switches it off, `jev-router status` shows counts and cost). While it is on, every prompt they type is sent to OpenRouter and TypeSafe.
+
+**What the installer puts where.**
+
+| Path | Contents |
+|---|---|
+| `~/.local/bin/jev-browser` | The CLI, with the key loaded from `~/.config/jev/openrouter.env` and OpenRouter pinned as Jev and typing provider |
+| `~/.local/bin/jev-browser-mcp` | The same settings for the MCP stdio server |
+| `~/.local/bin/jev-router` | The router: `hook`, `on`, `off`, `status`, `try` and `skills` subcommands |
+| `~/.local/bin/jev` | Sends one Jev decisions request (`jev request.json`); the `use-jev` skill uses it |
+| `~/.claude/skills/jev-browser`, `~/.claude/skills/use-jev` | Symlinks into this repository, so `git pull` updates them |
+| `~/.claude/agents/jev-tiny.md` and `jev-everyday`, `jev-large`, `jev-hardest` | Helper agents on Haiku, Sonnet, Opus and Opus |
+| `~/.config/jev/builtin-skills.json` | Descriptions of Claude Code's bundled skills, so the router can pick them |
+| `~/.claude/settings.json` | One `UserPromptSubmit` hook entry for `jev-router hook`, added once; a timestamped backup is saved first |
+
+The sources live in [`agent-setup/`](agent-setup) and [`skills/jev-browser`](skills/jev-browser).
 
 Give jev-browser a task and a URL.
 

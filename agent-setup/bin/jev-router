@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Jev router: sizes each Claude Code message and picks a skill for it, using Jev on OpenRouter.
+
+Commands:
+  jev-router hook                           UserPromptSubmit hook entry (reads the hook JSON on stdin)
+  jev-router on|off [models|skills|all]     switch routing for the current Claude Code session
+  jev-router status                         switches for this session, counts per size and skill, Jev cost
+  jev-router try "a request"                show what Jev would pick, without routing or logging
+  jev-router skills                         print the skill list Jev chooses from
+
+Jev only points. It never runs a skill or writes anything; the main session acts on its hints.
+The prompt text is sent to OpenRouter/TypeSafe but never written to the local log.
+"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+KEY_FILE = HOME / ".config/jev/openrouter.env"
+BUILTIN_SKILLS_FILE = HOME / ".config/jev/builtin-skills.json"
+STATE_DIR = HOME / ".local/state/jev-router"
+SESSIONS_DIR = STATE_DIR / "sessions"
+LOG_FILE = STATE_DIR / "log.jsonl"
+CLAUDE_DIR = HOME / ".claude"
+
+ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
+MODEL = "typesafe/jev-1.13"
+# Refuse the call rather than send text to a provider that trains on or keeps prompts.
+PRIVACY_FILTER = {"data_collection": "deny", "zdr": True}
+
+# Each Jev call must finish well inside the hook timeout so a slow Jev never holds up a message.
+REQUEST_TIMEOUT_SECONDS = 1.5
+CONFIDENCE_THRESHOLD = 0.6
+FOLLOW_UP_THRESHOLD = 0.5
+SKILL_GROUP_SIZE = 100
+MAX_PROMPT_CHARACTERS = 8000
+MAX_SKILL_DESCRIPTION_CHARACTERS = 300
+NONE_OPTION = "none_of_these"
+
+SIZE_DESCRIPTIONS = {
+    "tiny": "A lookup, a rename, or a one-line answer",
+    "everyday": "A normal email, post, or short document",
+    "large": "A multi-step build, research, or a full report",
+    "hardest": "Strategy, or anything where a wrong call is expensive",
+}
+HELPER_FOR_SIZE = {
+    "tiny": "jev-tiny",
+    "everyday": "jev-everyday",
+    "large": "jev-large",
+    "hardest": "jev-hardest",
+}
+SWITCH_NAMES = ("models", "skills")
+
+
+# ---------- Jev API ----------
+
+def read_api_key():
+    for line in KEY_FILE.read_text().splitlines():
+        if line.startswith("OPENROUTER_API_KEY="):
+            return line.split("=", 1)[1].strip()
+    raise RuntimeError(f"no OPENROUTER_API_KEY in {KEY_FILE}")
+
+
+def ask_jev(state_text, questions):
+    """Send one decisions request; return (response JSON, elapsed seconds)."""
+    body = json.dumps({
+        "model": MODEL,
+        "provider": PRIVACY_FILTER,
+        "state": state_text,
+        "questions": questions,
+    }).encode()
+    request = urllib.request.Request(ENDPOINT, data=body, method="POST", headers={
+        "Authorization": f"Bearer {read_api_key()}",
+        "Content-Type": "application/json",
+    })
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"HTTP {error.code}: {error.read().decode(errors='replace')[:300]}")
+    return payload, time.monotonic() - started
+
+
+# ---------- skill list ----------
+
+def read_skill_description(skill_file):
+    """Pull the description out of a SKILL.md frontmatter, including folded multi-line values."""
+    lines = skill_file.read_text(errors="replace").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    description_parts = []
+    collecting = False
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if collecting:
+            if line.startswith((" ", "\t")):
+                description_parts.append(line.strip())
+                continue
+            break
+        if line.startswith("description:"):
+            value = line.split(":", 1)[1].strip()
+            if value in ("", ">", "|", ">-", "|-"):
+                collecting = True
+            else:
+                description_parts.append(value)
+    description = " ".join(description_parts).strip().strip("'\"")
+    return description[:MAX_SKILL_DESCRIPTION_CHARACTERS]
+
+
+def enabled_plugin_skill_dirs():
+    """Yield (plugin name, skills directory) for plugins switched on in user settings."""
+    settings = json.loads((CLAUDE_DIR / "settings.json").read_text())
+    installed = json.loads((CLAUDE_DIR / "plugins/installed_plugins.json").read_text())["plugins"]
+    for plugin_id, is_enabled in settings.get("enabledPlugins", {}).items():
+        if is_enabled is not True or plugin_id not in installed:
+            continue
+        install_path = Path(installed[plugin_id][0]["installPath"])
+        yield plugin_id.split("@")[0], install_path / "skills"
+
+
+def build_skill_catalog():
+    """Return {skill name: one-line description} for every skill this Claude Code setup offers."""
+    catalog = {}
+    for skill_file in sorted((CLAUDE_DIR / "skills").glob("*/SKILL.md")):
+        catalog[skill_file.parent.name] = read_skill_description(skill_file)
+    for skill_file in sorted((CLAUDE_DIR / "skills/synced").glob("*/*/SKILL.md")):
+        catalog[f"anthropic-skills:{skill_file.parent.name}"] = read_skill_description(skill_file)
+    for plugin_name, skills_dir in enabled_plugin_skill_dirs():
+        for skill_file in sorted(skills_dir.glob("*/SKILL.md")):
+            catalog[f"{plugin_name}:{skill_file.parent.name}"] = read_skill_description(skill_file)
+    # Skills bundled inside Claude Code have no files on disk, so they are listed by hand.
+    if BUILTIN_SKILLS_FILE.exists():
+        catalog.update(json.loads(BUILTIN_SKILLS_FILE.read_text()))
+    return catalog
+
+
+def skill_question(skill_options):
+    options = dict(skill_options)
+    options[NONE_OPTION] = ("No listed skill fits: ordinary conversation, questions, coding, or small edits "
+                            "to existing files such as fixing a typo in a README or source file.")
+    return {
+        "type": "choice",
+        "instructions": "Which one skill (saved instruction set) should handle this request?",
+        "criteria": options,
+    }
+
+
+def split_into_groups(catalog):
+    names = list(catalog)
+    return [
+        {name: catalog[name] for name in names[start:start + SKILL_GROUP_SIZE]}
+        for start in range(0, len(names), SKILL_GROUP_SIZE)
+    ]
+
+
+# ---------- decisions ----------
+
+def size_questions():
+    return {
+        "size": {
+            "type": "choice",
+            "instructions": "What is the smallest AI model size that can do this job well?",
+            "criteria": SIZE_DESCRIPTIONS,
+        },
+        "follow_up": {
+            "type": "noul",
+            "instructions": "Is this message a short reply that only makes sense inside an ongoing "
+                            "conversation, rather than a self-contained request?",
+            "criteria": {
+                "true": "A follow-up such as 'yes do that', 'make it shorter', 'the second one', 'try again'.",
+                "false": "A request someone could act on without seeing the earlier conversation.",
+            },
+        },
+    }
+
+
+def decide(prompt, want_size, want_skill):
+    """Ask Jev everything needed in one call (plus a final skill round when the list is split)."""
+    state_text = prompt[:MAX_PROMPT_CHARACTERS]
+    questions = size_questions() if want_size else {}
+    skill_groups = split_into_groups(build_skill_catalog()) if want_skill else []
+    for group_number, group in enumerate(skill_groups):
+        questions[f"skill_group_{group_number}"] = skill_question(group)
+
+    response, elapsed_seconds = ask_jev(state_text, questions)
+    answers = response["answers"]
+    decision = {
+        "cost": response.get("usage", {}).get("cost", 0),
+        "elapsed_seconds": round(elapsed_seconds, 3),
+    }
+    if want_size:
+        decision["size"] = answers["size"]["choice"]
+        decision["size_confidence"] = answers["size"]["confidence"]
+        decision["follow_up"] = answers["follow_up"]["noul"]
+    if want_skill:
+        decision.update(pick_skill(state_text, skill_groups, answers, decision))
+    return decision
+
+
+def pick_skill(state_text, skill_groups, answers, decision):
+    group_answers = [answers[f"skill_group_{number}"] for number in range(len(skill_groups))]
+    if len(group_answers) == 1:
+        return {"skill": group_answers[0]["choice"], "skill_confidence": group_answers[0]["confidence"]}
+
+    winners = {}
+    for group, answer in zip(skill_groups, group_answers):
+        if answer["choice"] != NONE_OPTION:
+            winners[answer["choice"]] = group[answer["choice"]]
+    if not winners:
+        return {"skill": NONE_OPTION, "skill_confidence": min(a["confidence"] for a in group_answers)}
+
+    final_response, final_seconds = ask_jev(state_text, {"skill_final": skill_question(winners)})
+    decision["cost"] += final_response.get("usage", {}).get("cost", 0)
+    decision["elapsed_seconds"] = round(decision["elapsed_seconds"] + final_seconds, 3)
+    final_answer = final_response["answers"]["skill_final"]
+    return {"skill": final_answer["choice"], "skill_confidence": final_answer["confidence"]}
+
+
+def routed_helper(decision):
+    """Return the helper agent name, or None when the main session should handle the message."""
+    if decision["size_confidence"] < CONFIDENCE_THRESHOLD:
+        return None
+    if decision["follow_up"] >= FOLLOW_UP_THRESHOLD:
+        return None
+    return HELPER_FOR_SIZE[decision["size"]]
+
+
+def chosen_skill(decision):
+    if decision["skill"] == NONE_OPTION or decision["skill_confidence"] < CONFIDENCE_THRESHOLD:
+        return None
+    return decision["skill"]
+
+
+def build_context(decision, helper, skill):
+    lines = []
+    if skill:
+        confidence = decision["skill_confidence"]
+        lines.append(
+            f"[jev-router] Jev picked the skill `{skill}` for this message (confidence {confidence:.2f}). "
+            f"Load it with the Skill tool unless it is plainly wrong, and tell the user in one short line: "
+            f"\"Skill: {skill} (Jev {confidence:.2f})\"."
+        )
+    if helper:
+        confidence = decision["size_confidence"]
+        skill_note = f" Tell the helper to load the `{skill}` skill first instead of loading it yourself." if skill else ""
+        lines.append(
+            f"[jev-router] Jev sized this message as '{decision['size']}' (confidence {confidence:.2f}). "
+            f"Delegate the whole task to the `{helper}` subagent with the Agent tool: write it a self-contained "
+            f"task that includes any context from this conversation it needs.{skill_note} Pass its result back "
+            f"to the user, keeping its final 'Done by:' line. Start your reply with one line: "
+            f"\"Routed: {decision['size']} → {helper} (Jev {confidence:.2f})\". If delegating plainly cannot work "
+            f"(the task depends on this conversation's live state or needs back-and-forth with the user), "
+            f"handle it yourself and say so in that line."
+        )
+    return "\n".join(lines)
+
+
+# ---------- session switches and log ----------
+
+def session_file(session_id):
+    return SESSIONS_DIR / f"{session_id}.json"
+
+
+def read_switches(session_id):
+    path = session_file(session_id)
+    if not session_id or not path.exists():
+        return {name: False for name in SWITCH_NAMES}
+    return json.loads(path.read_text())
+
+
+def write_switches(session_id, switches):
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    session_file(session_id).write_text(json.dumps(switches))
+
+
+def append_log(entry):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    entry["time"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with LOG_FILE.open("a") as log:
+        log.write(json.dumps(entry) + "\n")
+
+
+def current_session_id():
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not session_id:
+        sys.exit("jev-router: CLAUDE_CODE_SESSION_ID is not set; run this from inside a Claude Code session.")
+    return session_id
+
+
+# ---------- commands ----------
+
+def is_router_control_message(prompt):
+    lowered = prompt.lower()
+    return prompt.lstrip().startswith("/") or ("jev" in lowered and "router" in lowered)
+
+
+def is_agent_message(prompt):
+    # Subagent hand-backs and task notifications arrive as prompts too; they are reports, not requests.
+    markers = ("<agent-message", "[Subagent hand-back]", "<task-notification>", "[SYSTEM NOTIFICATION",
+               "<cross-session-message")
+    return any(marker in prompt[:2000] for marker in markers)
+
+
+def command_hook():
+    hook_input = json.load(sys.stdin)
+    session_id = hook_input.get("session_id", "")
+    prompt = hook_input.get("prompt", "")
+    switches = read_switches(session_id)
+    if not any(switches.values()) or not prompt.strip():
+        return
+    if is_router_control_message(prompt) or is_agent_message(prompt):
+        return
+
+    entry = {"session": session_id, **switches}
+    try:
+        decision = decide(prompt, switches["models"], switches["skills"])
+    except Exception as error:  # any failure: stay silent so the message goes through untouched
+        entry["error"] = f"{type(error).__name__}: {error}"[:300]
+        append_log(entry)
+        return
+
+    helper = routed_helper(decision) if switches["models"] else None
+    skill = chosen_skill(decision) if switches["skills"] else None
+    entry.update(decision)
+    if switches["models"]:
+        entry["routed_to"] = helper or "main"
+    if switches["skills"]:
+        entry["skill_used"] = skill or "normal pick"
+    append_log(entry)
+
+    context = build_context(decision, helper, skill)
+    if context:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }}))
+
+
+def command_switch(turn_on, which):
+    names = SWITCH_NAMES if which == "all" else (which,)
+    if which != "all" and which not in SWITCH_NAMES:
+        sys.exit("usage: jev-router on|off [models|skills|all]")
+    session_id = current_session_id()
+    switches = read_switches(session_id)
+    for name in names:
+        switches[name] = turn_on
+    write_switches(session_id, switches)
+    print(f"Session {session_id[:8]}: models {'ON' if switches['models'] else 'OFF'}, "
+          f"skills {'ON' if switches['skills'] else 'OFF'}")
+    if any(switches.values()):
+        print("While on, every message you type is sent to OpenRouter and TypeSafe. Keep it off for private work.")
+
+
+def count(entries, field):
+    totals = {}
+    for entry in entries:
+        if field in entry:
+            totals[entry[field]] = totals.get(entry[field], 0) + 1
+    return ", ".join(f"{name} {number}" for name, number in sorted(totals.items(), key=lambda item: -item[1])) or "none"
+
+
+def command_status():
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if session_id:
+        switches = read_switches(session_id)
+        print(f"This session ({session_id[:8]}): models {'ON' if switches['models'] else 'OFF'}, "
+              f"skills {'ON' if switches['skills'] else 'OFF'}")
+    entries = [json.loads(line) for line in LOG_FILE.read_text().splitlines()] if LOG_FILE.exists() else []
+    failures = [entry for entry in entries if "error" in entry]
+    total_cost = sum(entry.get("cost", 0) for entry in entries)
+    print(f"Messages checked: {len(entries)} (failed or timed out, passed through untouched: {len(failures)})")
+    print(f"Jev cost so far: ${total_cost:.6f}")
+    print(f"Jev's size pick: {count(entries, 'size')}")
+    print(f"Where they went: {count(entries, 'routed_to')}")
+    print(f"Skill hints:     {count(entries, 'skill_used')}")
+
+
+def command_try(request_text):
+    decision = decide(request_text, want_size=True, want_skill=True)
+    helper = routed_helper(decision)
+    skill = chosen_skill(decision)
+    print(f"Size:   {decision['size']} (confidence {decision['size_confidence']:.2f}), "
+          f"follow-up {decision['follow_up']:.2f} -> {helper or 'main session'}")
+    print(f"Skill:  {decision['skill']} (confidence {decision['skill_confidence']:.2f}) -> "
+          f"{skill or 'normal pick'}")
+    print(f"Jev:    {decision['elapsed_seconds']:.2f} s, ${decision['cost']:.6f}")
+
+
+def command_skills():
+    catalog = build_skill_catalog()
+    for name, description in catalog.items():
+        print(f"{name}: {description[:100]}")
+    print(f"\n{len(catalog)} skills")
+
+
+def main():
+    arguments = sys.argv[1:]
+    command = arguments[0] if arguments else "status"
+    if command == "hook":
+        try:
+            command_hook()
+        except Exception:
+            pass  # the hook must never block or break a message
+    elif command in ("on", "off"):
+        command_switch(command == "on", arguments[1] if len(arguments) > 1 else "all")
+    elif command == "status":
+        command_status()
+    elif command == "try" and len(arguments) == 2:
+        command_try(arguments[1])
+    elif command == "skills":
+        command_skills()
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
