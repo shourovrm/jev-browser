@@ -80,11 +80,16 @@ This is early software. Expect rough edges on harder sites. Issues and pull requ
 
 ## Demo
 
-Searches GitHub for this repository, opens Releases, and answers a question about the page. Every Jev judgment is on the right: the action chosen, its confidence, and the goal and stuck probabilities for each step.
+Four live runs, one for each kind of page this fork added support for. Each clip shows the browser on the left and, on the right, the steps Jev chose and the run's result, time and Jev cost:
 
-![jev-browser searching GitHub and opening its own Releases page, judgment trace on the right](assets/github-demo.gif)
+- **Shadow DOM and modal dialogs.** On the Shoelace docs, the buttons live inside web components and a promo modal covers the page. Jev dismisses the modal, then opens the example dialog: done in 3 steps.
+- **Arrow keys in a combobox.** In the W3C autocomplete example, Jev types "Ne", presses Down and picks "Nevada": done in 4 steps.
+- **Iframes.** In the W3Schools editor, the form sits inside the result iframe. Jev submits it there: done in 2 steps.
+- **ARIA options.** In the W3C listbox, the options are plain `<li role="option">` elements. Jev selects "Neptunium": done in 2 steps.
 
-Full-resolution video: [assets/github-demo.mp4](assets/github-demo.mp4).
+![jev-browser runs on Shoelace, a W3C combobox, a W3Schools iframe and a W3C listbox, with Jev's steps on the right](assets/jev-browser-demo.gif)
+
+Full-resolution video: [assets/jev-browser-demo.mp4](assets/jev-browser-demo.mp4). `scripts/demo/record.sh` records it again.
 
 ## Install
 
