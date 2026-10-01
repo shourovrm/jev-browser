@@ -23,6 +23,8 @@ export interface RawElement {
   selected?: boolean; // aria-selected or aria-checked is "true": the option, tab or menu item is chosen
   behindModal?: boolean; // a modal dialog is open and this control is outside it, so clicks cannot reach it
   value?: string; // what a text field currently holds; never read from password fields
+  frameIndex?: number; // index into the step's scanned frames; absent for the main frame
+  frameHost?: string; // host of the element's frame, set only when its origin differs from the page's
 }
 
 /** One native <select> option: its DOM index and (scrubbed) label. */
@@ -40,6 +42,7 @@ export interface PageElement {
   submitVia?: "click" | "enter"; // for kind === "submit": click the control, or press Enter on the field
   options?: SelectOption[]; // for kind === "select": the native option labels
   menu?: "open" | "closed"; // for kind === "click": a menu toggle, opened by openMenu() when closed
+  frameIndex?: number; // the frame the action runs in; absent for the main frame
 }
 
 const JUNK_NAMES = new Set([
@@ -108,7 +111,10 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
         id: `e${elements.length + 1}`,
         attr: el.attr,
         kind: "fill_password",
-        description: `input "${label || "password"}" (fill with the configured password; it is never typed by a model)`,
+        description:
+          `input "${label || "password"}" (fill with the configured password; it is never typed by a model)` +
+          (el.frameHost ? ` (inside frame from ${el.frameHost.slice(0, 70)})` : ""),
+        frameIndex: el.frameIndex,
       });
       continue;
     }
@@ -146,6 +152,9 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
     // Without the field's current text Jev cannot tell that a pick from an
     // autocomplete list, or its own earlier typing, already filled it.
     const holding = el.value ? ` holding "${el.value.slice(0, 60)}"` : "";
+    // A control from another origin is often a third-party widget (payment,
+    // map, consent); Jev should know whose page it is acting on.
+    const frameNote = el.frameHost ? ` (inside frame from ${el.frameHost.slice(0, 70)})` : "";
     elements.push({
       id,
       attr: el.attr,
@@ -160,9 +169,10 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
               ? `${el.tag} "${label}"${holding} (type without submitting)`
               : kind === "select"
                 ? `${el.tag} "${label}" (dropdown; a follow-up picks the option)`
-                : `${el.tag} "${label}"${hrefTail}${roleNote(el.role, el.selected)}${menuNote(el.menu)}`) + blockedNote,
+                : `${el.tag} "${label}"${hrefTail}${roleNote(el.role, el.selected)}${menuNote(el.menu)}`) + blockedNote + frameNote,
       options: kind === "select" ? (el.options ?? []) : undefined,
       menu: kind === "click" ? el.menu : undefined,
+      frameIndex: el.frameIndex,
     });
     // Non-search single-line text fields additionally offer submit (press
     // Enter), which keeps Enter-driven flows reachable as two explicit steps:
@@ -174,7 +184,8 @@ export function buildActionSpace(raw: RawElement[], opts: BuildActionSpaceOption
         attr: el.attr,
         kind: "submit",
         submitVia: "enter",
-        description: `${el.tag} "${label}" (submit the form now)${blockedNote}`,
+        description: `${el.tag} "${label}" (submit the form now)${blockedNote}${frameNote}`,
+        frameIndex: el.frameIndex,
       });
     }
   }

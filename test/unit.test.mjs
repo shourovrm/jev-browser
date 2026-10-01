@@ -89,14 +89,14 @@ test("buildActionSpace describes menu toggles and their open/closed state", () =
   assert.equal(elements[1].description, 'button "About" (menu, open)');
 });
 
-async function runMenuScenario(t, pageHtml, labelsToClick, scripts = {}, stuckAtSteps = []) {
+async function runMenuScenario(t, pageHtml, labelsToClick, scripts = {}, { stuckAtSteps = [], navigateOptions = {} } = {}) {
   // Step N clicks the control whose description holds labelsToClick[N-1]; the
   // step after the last label records what is offered and answers done.
   const http = await import("node:http");
   const server = http.createServer((request, response) => {
     const script = scripts[request.url];
     if (script) {
-      response.setHeader("Content-Type", "text/javascript");
+      response.setHeader("Content-Type", script.contentType ?? "text/javascript");
       setTimeout(() => response.end(script.body), script.delayMs);
       return;
     }
@@ -129,13 +129,16 @@ async function runMenuScenario(t, pageHtml, labelsToClick, scripts = {}, stuckAt
       return { answers, usage: { input_tokens: 1, output_tokens: 1 }, model: "fixture" };
     },
   };
+  const origin = `http://127.0.0.1:${server.address().port}`;
   const result = await navigate({
     task: "Open the Award Search page",
-    startUrl: `http://127.0.0.1:${server.address().port}/`,
+    startUrl: `${origin}/`,
     transport,
     maxSteps: labelsToClick.length + 1,
     maxSeconds: 30,
     screenshot: "none",
+    // A function receives the page origin, for options that must name it.
+    ...(typeof navigateOptions === "function" ? navigateOptions(origin) : navigateOptions),
   });
   return { offeredPerStep, statesPerStep, result };
 }
@@ -470,7 +473,7 @@ test("a menu opened by mistake is closed with Escape and the next action succeed
 });
 
 test("when the stuck watcher fires while a menu has focus, Escape is pressed once instead of stopping", async (t) => {
-  const { result } = await runMenuScenario(t, menuOpenedByMistake, ["Products", "Scroll down", "Contact us", "Contact us"], {}, [3]);
+  const { result } = await runMenuScenario(t, menuOpenedByMistake, ["Products", "Scroll down", "Contact us", "Contact us"], {}, { stuckAtSteps: [3] });
   assert.equal(result.steps[2].proposed_action.startsWith("click_"), true);
   assert.equal(result.steps[2].executed_action, "press_escape");
   assert.match(result.steps[2].recovery_reason, /stuck watcher fired while a menu had focus/);
@@ -478,7 +481,7 @@ test("when the stuck watcher fires while a menu has focus, Escape is pressed onc
 });
 
 test("the stuck watcher still stops the run when no menu has focus", async (t) => {
-  const { result } = await runMenuScenario(t, keyboardMenubar, ["Scroll down", "Scroll down", "Scroll down"], {}, [3]);
+  const { result } = await runMenuScenario(t, keyboardMenubar, ["Scroll down", "Scroll down", "Scroll down"], {}, { stuckAtSteps: [3] });
   assert.equal(result.status, "stuck");
 });
 
@@ -539,6 +542,83 @@ test("a link clicked at the first step of a fresh browser navigates at once, and
   assert.match(result.final_url, /\/next$/);
   assert.equal(result.steps[0].outcome, `navigated to http://127.0.0.1:${server.address().port}/next`);
   assert.equal(requests.filter((url) => url === "/next").length, 1);
+});
+
+// Iframe fixtures. A page served from 127.0.0.1 embeds localhost for a
+// cross-origin frame: same port, different host, so a different origin and
+// site. Frames report back to the page by setting its title through
+// postMessage, an in-page effect that works across origins.
+const htmlPage = (body) => ({ body, delayMs: 0, contentType: "text/html" });
+const reportToParent = `<script>const report = (text) => parent.postMessage(text, "*");</script>`;
+const titleFromMessages = `<script>addEventListener("message", (event) => { document.title = String(event.data); });</script>`;
+const crossOriginFrame = (path, style = "width: 500px; height: 220px") =>
+  `<iframe id="frame" style="${style}"></iframe>
+   <script>document.getElementById("frame").src = location.origin.replace("127.0.0.1", "localhost") + "${path}";</script>`;
+
+test("a form inside a same-origin iframe is typed into and submitted", async (t) => {
+  // Typing goes through a mocked OpenAI-compatible endpoint, so no network call is made.
+  const previousBaseUrl = process.env.JEV_BROWSER_TYPE_BASE_URL;
+  process.env.JEV_BROWSER_TYPE_BASE_URL = "http://typing.test/v1";
+  t.after(() => {
+    if (previousBaseUrl === undefined) delete process.env.JEV_BROWSER_TYPE_BASE_URL;
+    else process.env.JEV_BROWSER_TYPE_BASE_URL = previousBaseUrl;
+  });
+  t.mock.method(globalThis, "fetch", async () => chatCompletion("ada@example.com"));
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Join our newsletter</p>
+    <iframe src="/signup" style="width: 500px; height: 220px"></iframe>${titleFromMessages}`;
+  const signup = `<!doctype html>${reportToParent}
+    <form onsubmit="event.preventDefault(); report('Subscribed ' + this.email.value)">
+      <label>Email <input name="email"></label><button>Subscribe</button></form>`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, ["Email", "Subscribe"], { "/signup": htmlPage(signup) });
+  assert.ok(offeredPerStep[0].includes('input "Email" (type without submitting)'), "same-origin frames get no origin note");
+  assert.equal(result.steps[0].detail, 'typed "ada@example.com" via compatible-endpoint');
+  assert.equal(result.final_title, "Subscribed ada@example.com");
+});
+
+test("a link inside a cross-origin iframe is offered with the frame's origin and clicked", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Today's offer</p>${crossOriginFrame("/widget")}${titleFromMessages}`;
+  const widget = `<!doctype html>${reportToParent}<a href="/offer" onclick="event.preventDefault(); report('Offer opened')">Open the offer</a>`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, ["Open the offer"], { "/widget": htmlPage(widget) });
+  const offer = offeredPerStep[0].find((description) => description.startsWith('a "Open the offer"'));
+  assert.match(offer, /\(inside frame from localhost:\d+\)$/);
+  assert.equal(result.final_title, "Offer opened");
+});
+
+test("text inside a visible frame is judged, and a change inside it counts as an effect", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Order online</p>
+    <iframe src="/order" style="width: 500px; height: 220px"></iframe>`;
+  const order = `<!doctype html><form action="/thanks"><button>Place order</button></form>`;
+  const thanks = `<!doctype html><p>Thank you, your order number is 4417 and it will be ready in twenty minutes.</p>`;
+  const { statesPerStep, result } = await runMenuScenario(t, pageHtml, ["Place order"], { "/order": htmlPage(order), "/thanks?": htmlPage(thanks) });
+  assert.match(statesPerStep[0].page_text_excerpt, /Order online/);
+  assert.equal(result.steps[0].outcome, "content inside a frame changed");
+  assert.match(statesPerStep[1].page_text_excerpt, /Frame: Thank you, your order number is 4417/);
+});
+
+test("controls in hidden, tiny and blank iframes are not offered", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><a href="/about">About us</a>
+    <iframe src="/tracker" style="display: none"></iframe>
+    <iframe src="/tracker" style="width: 20px; height: 20px"></iframe>
+    <iframe src="about:blank" style="width: 500px; height: 200px"></iframe>`;
+  const tracker = `<!doctype html><a href="/pixel">Tracking pixel link</a>`;
+  const { offeredPerStep, result } = await runMenuScenario(t, pageHtml, [], { "/tracker": htmlPage(tracker) });
+  assert.equal(result.status, "done");
+  assert.ok(offeredPerStep[0].some((description) => description.startsWith('a "About us"')));
+  assert.ok(!offeredPerStep[0].some((description) => description.includes("Tracking pixel")));
+});
+
+test("a password field inside a frame is filled only when the frame's own origin is the trusted one", async (t) => {
+  const login = `<!doctype html><label>Password <input type="password"></label>`;
+  const scripts = { "/login": htmlPage(login) };
+  const sameOrigin = `<!doctype html><title>Sign in</title><p>Sign in</p><iframe src="/login" style="width: 500px; height: 200px"></iframe>`;
+  const crossOrigin = `<!doctype html><title>Sign in</title><p>Sign in</p>${crossOriginFrame("/login")}`;
+  // The trusted origin is the top page's; the fill must follow the frame's origin, not the page's.
+  const trustTopOrigin = { navigateOptions: (origin) => ({ password: { value: "correct-horse-battery", origin } }) };
+  const refused = await runMenuScenario(t, crossOrigin, ["configured password"], scripts, trustTopOrigin);
+  assert.match(refused.result.steps[0].action_error ?? "", /^origin_mismatch: refused to fill on http:\/\/localhost:\d+/);
+  assert.equal(refused.result.password_filled, undefined);
+  const filled = await runMenuScenario(t, sameOrigin, ["configured password"], scripts, trustTopOrigin);
+  assert.equal(filled.result.password_filled, true);
 });
 
 test("resolvePrivateTransport: other providers are left as they are", () => {

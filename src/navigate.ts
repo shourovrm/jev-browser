@@ -3,7 +3,7 @@
 // execution, the deadline is a real AbortSignal threaded through Jev, the
 // typing generator, and every Playwright timeout, usage is per-run, and the
 // final payload/screenshot extraction is best-effort.
-import { chromium, type Browser, type BrowserContext, type ConsoleMessage, type ElementHandle, type Page, type Request, type Response } from "playwright";
+import { chromium, type Browser, type BrowserContext, type ConsoleMessage, type ElementHandle, type Frame, type Page, type Request, type Response } from "playwright";
 import { generateText } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
@@ -297,29 +297,111 @@ async function openModalHandle(page: Page): Promise<ElementHandle<Node> | null> 
   return modals[shownIndex] ?? null;
 }
 
+// Frames smaller than this in either dimension are tracking pixels and ad
+// slots far more often than something a task needs.
+const MIN_FRAME_SIDE_PX = 50;
+
+/**
+ * The frames worth scanning this step, main frame first. Child frames are
+ * skipped when they are detached, hidden (no bounding box) or smaller than
+ * MIN_FRAME_SIDE_PX. about:blank frames are kept: pages such as the
+ * W3Schools editor write their content into one. Cross-origin frames are
+ * included: Playwright reaches them like any other frame.
+ */
+async function scannableFrames(page: Page): Promise<Frame[]> {
+  const frames = [page.mainFrame()];
+  for (const frame of page.frames()) {
+    if (frame === page.mainFrame() || frame.isDetached()) continue;
+    const frameElement = await frame.frameElement().catch(() => null);
+    const box = await frameElement?.boundingBox().catch(() => null);
+    await frameElement?.dispose();
+    if (!box || box.width < MIN_FRAME_SIDE_PX || box.height < MIN_FRAME_SIDE_PX) continue;
+    frames.push(frame);
+  }
+  return frames;
+}
+
+/**
+ * The frame's real origin. Read from the page rather than the frame URL,
+ * because an about:blank or srcdoc frame inherits its parent's origin while
+ * its URL has none. "null" for sandboxed frames.
+ */
+async function frameOrigin(frame: Frame): Promise<string | null> {
+  return frame.evaluate(() => window.origin).catch(() => null);
+}
+
+/**
+ * Scans the main frame and every scannable child frame, main frame first, so
+ * the page's own controls come first in the shared MAX_ELEMENTS budget.
+ * Returns the frames too: each element's frameIndex points into that list,
+ * and actions run through the element's own frame.
+ */
 async function extractAndStamp(
   page: Page,
   bounded: (cap: number) => number,
   caps: CaptureCaps = DEFAULT_CAPTURE_CAPS,
   includePasswordInputs = false,
+): Promise<{ raw: RawElement[]; frames: Frame[] }> {
+  const frames = await scannableFrames(page);
+  const pageOrigin = await frameOrigin(page.mainFrame());
+  const raw: RawElement[] = [];
+  for (const [frameIndex, frame] of frames.entries()) {
+    const isMainFrame = frameIndex === 0;
+    try {
+      const frameElements = await scanFrame(frame, caps, includePasswordInputs, isMainFrame ? await openModalHandle(page) : null, isMainFrame ? "j" : `f${frameIndex}-j`);
+      if (!isMainFrame) {
+        const origin = await frameOrigin(frame);
+        // Only a real, different origin gets a host note; a sandboxed frame's
+        // "null" origin has no host to name.
+        const host = origin && origin !== "null" && origin !== pageOrigin ? new URL(origin).host : undefined;
+        for (const element of frameElements) {
+          element.frameIndex = frameIndex;
+          element.frameHost = host;
+        }
+      }
+      raw.push(...frameElements);
+    } catch (error) {
+      // A child frame can detach or navigate mid-scan; its controls are just
+      // missing this step. The main frame's errors keep their old meaning.
+      if (isMainFrame) throw error;
+    }
+  }
+  return { raw, frames };
+}
+
+/** Clears old stamps in one frame, then stamps and describes its candidates. */
+async function scanFrame(
+  frame: Frame,
+  caps: CaptureCaps,
+  includePasswordInputs: boolean,
+  modal: ElementHandle<Node> | null,
+  attrPrefix: string,
 ): Promise<RawElement[]> {
   // Clear stamps from previous steps first: elements that dropped out of the
   // candidate list keep their old data-jev-id, which would make selectors
   // match more than one element.
-  await page.locator("[data-jev-id]").evaluateAll((stamped) => stamped.forEach((el) => el.removeAttribute("data-jev-id")));
-  const modal = await openModalHandle(page);
+  await frame.locator("[data-jev-id]").evaluateAll((stamped) => stamped.forEach((el) => el.removeAttribute("data-jev-id")));
   try {
-    return await scanCandidates(page, caps, includePasswordInputs, modal);
+    return await scanCandidates(frame, caps, includePasswordInputs, modal, attrPrefix);
   } finally {
     await modal?.dispose();
   }
 }
 
-async function scanCandidates(page: Page, caps: CaptureCaps, includePasswordInputs: boolean, modal: ElementHandle<Node> | null): Promise<RawElement[]> {
-  return page.locator(CANDIDATE_SELECTOR).evaluateAll(
+async function scanCandidates(
+  frame: Frame,
+  caps: CaptureCaps,
+  includePasswordInputs: boolean,
+  modal: ElementHandle<Node> | null,
+  attrPrefix: string,
+): Promise<RawElement[]> {
+  return frame.locator(CANDIDATE_SELECTOR).evaluateAll(
     // The modal arrives as a live element; it is typed unknown here because
     // Playwright's handle-unboxing types recurse too deeply over Element.
-    (candidates, { cap, includePw, modal: modalArgument }: { cap: CaptureCaps; includePw: boolean; modal: unknown }) => {
+    (
+      candidates,
+      { cap, includePw, modal: modalArgument, attrPrefix }: { cap: CaptureCaps; includePw: boolean; modal: unknown; attrPrefix: string },
+    ) => {
       const modal = modalArgument as Element | null;
       // Text as rendered through <slot> elements. A web component's inner
       // control often holds only a <slot>, so its own innerText and
@@ -435,7 +517,7 @@ async function scanCandidates(page: Page, caps: CaptureCaps, includePasswordInpu
         // the site's own Enter handler); a textarea Enter is just a newline.
         const enterSubmittable = typeable && tag !== "textarea";
         if (!clickable && !typeable && !selectable && !(passwordInput && includePw)) continue;
-        const attr = `j${out.length + 1}`;
+        const attr = `${attrPrefix}${out.length + 1}`;
         el.setAttribute("data-jev-id", attr);
         const expandedAttr = el.getAttribute("aria-expanded");
         const popupAttr = el.getAttribute("aria-haspopup");
@@ -459,7 +541,7 @@ async function scanCandidates(page: Page, caps: CaptureCaps, includePasswordInpu
       }
       return out;
     },
-    { cap: caps, includePw: includePasswordInputs, modal },
+    { cap: caps, includePw: includePasswordInputs, modal, attrPrefix },
   );
 }
 
@@ -470,6 +552,29 @@ interface Observables {
   scrollY: number;
   excerpt: string;
   visibleExcerpt: string;
+  frameText: string; // text of the visible child frames, for the judged excerpt and change detection
+}
+
+/**
+ * The text of every scannable child frame, each marked "Frame:". Without it
+ * a form submitted inside an iframe looks like "no visible change" and its
+ * result page is invisible to the goal judgment.
+ */
+async function childFramesText(page: Page, cap: number): Promise<string> {
+  const parts: string[] = [];
+  for (const frame of (await scannableFrames(page)).slice(1)) {
+    const text = await frame.evaluate(() => (document.body?.innerText ?? "").replace(/\s+/g, " ").trim()).catch(() => "");
+    if (text) parts.push(`Frame: ${text}`);
+  }
+  return parts.join(" | ").slice(0, cap);
+}
+
+/** The main frame's visible text with the frames' text after it; frames get up to half the budget. */
+function withFrameText(mainText: string, frameText: string, cap: number): string {
+  if (!frameText) return mainText.slice(0, cap);
+  const frameShare = Math.min(frameText.length, Math.floor(cap / 2));
+  const main = mainText.slice(0, cap - frameShare - 3);
+  return main ? `${main} | ${frameText.slice(0, frameShare)}` : frameText.slice(0, cap);
 }
 
 /**
@@ -545,11 +650,14 @@ async function pageObservables(page: Page, bounded: (cap: number) => number, exc
       })(),
     }), { cap: excerptCap, modalText })
     .catch(() => ({ length: 0, scrollY: 0, excerpt: "", visibleExcerpt: "" }));
-  return { url, title, textLength: data.length, scrollY: data.scrollY, excerpt: data.excerpt, visibleExcerpt: data.visibleExcerpt };
+  const frameText = await childFramesText(page, excerptCap);
+  // An open modal is all a person sees, so it stays the whole excerpt.
+  const visibleExcerpt = modalText !== null ? data.visibleExcerpt : withFrameText(data.visibleExcerpt, frameText, excerptCap);
+  return { url, title, textLength: data.length, scrollY: data.scrollY, excerpt: data.excerpt, visibleExcerpt, frameText };
 }
 
 /** What a menu toggle shows right now: its aria-expanded value and how many controls are visible. */
-async function menuSnapshot(page: Page, selector: string) {
+async function menuSnapshot(page: Page | Frame, selector: string) {
   const expanded = await page
     .locator(selector)
     .getAttribute("aria-expanded", { timeout: 1_000 })
@@ -575,7 +683,7 @@ function menuOpened(before: { visibleControls: number }, after: { expanded: stri
 // some menus open on hover only, and some ignore clicks until the site's scripts have
 // loaded (nsf.gov takes seconds after its text appears). Try hover, then click, then wait
 // for the page to finish loading and click again. Returns what happened, for the trace.
-async function openMenu(page: Page, selector: string, bounded: (cap: number) => number): Promise<string> {
+async function openMenu(page: Page | Frame, selector: string, bounded: (cap: number) => number): Promise<string> {
   const before = await menuSnapshot(page, selector);
   const settleMenu = () => page.waitForTimeout(350);
 
@@ -786,6 +894,11 @@ async function settle(page: Page, bounded: (cap: number) => number) {
   // before DOMContentLoaded; a click in between lands on a control that does
   // nothing yet. Bounded, because ads and trackers can hold load back for long.
   await page.waitForLoadState("load", { timeout: bounded(5_000) }).catch(() => {});
+  // A form submitted inside an iframe navigates only that frame; without
+  // this the outcome is judged before the frame's result page is there.
+  for (const frame of page.frames()) {
+    if (frame !== page.mainFrame()) await frame.waitForLoadState("load", { timeout: bounded(3_000) }).catch(() => {});
+  }
   // DOM-stability settle: two consecutive identical fingerprints mean the page
   // has stopped re-rendering, which is the signal we actually want; quiet
   // network was only ever a proxy for it, and analytics pings keep heavy sites
@@ -1138,7 +1251,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
         }
       }
 
-      const raw = await extractAndStamp(page, bounded, captureCaps, Boolean(options.password));
+      const { raw, frames: stepFrames } = await extractAndStamp(page, bounded, captureCaps, Boolean(options.password));
       // A page that already holds the value can echo it into any extracted
       // string (labels, hrefs, option text). Scrub host-side before the
       // action space or any model-facing state is built from these. These
@@ -1150,6 +1263,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
         for (const el of raw) {
           el.text = redactor.redactCapped(el.text, CREDENTIAL_VISIBLE.label);
           el.href = redactor.redactCapped(el.href, CREDENTIAL_VISIBLE.href);
+          if (el.frameHost) el.frameHost = redactor.redact(el.frameHost);
           if (el.value) el.value = redactor.redactCapped(el.value, CREDENTIAL_VISIBLE.label);
           if (el.options) el.options = el.options.map((o) => ({ i: o.i, label: redactor.redactCapped(o.label, CREDENTIAL_VISIBLE.option) }));
         }
@@ -1242,6 +1356,10 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
           chosen === `search_${e.id}` ||
           chosen === `fill_password_${e.id}`,
       );
+      // Element actions run in the element's own frame; the main frame when
+      // it has none. A frame that detached since the scan makes the action
+      // fail like any other stale element.
+      const target: Frame = element?.frameIndex !== undefined ? stepFrames[element.frameIndex] : page.mainFrame();
 
       let detail = chosen;
       let actionError: string | undefined;
@@ -1287,7 +1405,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
             } else {
               // Fill only: submitting is a separate submit_eN decision, so an
               // ordinary form is never submitted mid-task by a field fill.
-              await page.fill(selectorFor(element), generated.text, { timeout: bounded(4_000) });
+              await target.fill(selectorFor(element), generated.text, { timeout: bounded(4_000) });
               detail = `typed "${generated.text}" via ${generated.via}`;
               typedIntoLabel = element.description.match(/"([^"]*)"/)?.[1] ?? element.kind;
             }
@@ -1316,17 +1434,17 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
                 recordTypingWarning(step, generated.code, generated.message, { finishReason: generated.finishReason, fallback: "keyword-heuristic" });
               }
             }
-            await page.fill(selectorFor(element), text, { timeout: bounded(4_000) });
-            await page.press(selectorFor(element), "Enter", { timeout: bounded(4_000) });
+            await target.fill(selectorFor(element), text, { timeout: bounded(4_000) });
+            await target.press(selectorFor(element), "Enter", { timeout: bounded(4_000) });
             detail = `searched "${text}" via ${via}`;
             typedIntoLabel = element.description.match(/"([^"]*)"/)?.[1] ?? element.kind;
           }
         } else if (chosen.startsWith("submit_")) {
           if (element.submitVia === "click") {
-            await page.click(selectorFor(element), { timeout: bounded(4_000) });
+            await target.click(selectorFor(element), { timeout: bounded(4_000) });
             detail = `submitted form: ${element.description}`;
           } else {
-            await page.press(selectorFor(element), "Enter", { timeout: bounded(4_000) });
+            await target.press(selectorFor(element), "Enter", { timeout: bounded(4_000) });
             detail = `submitted form: Enter on ${element.description}`;
           }
         } else if (chosen.startsWith("select_")) {
@@ -1348,7 +1466,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
             });
             const pickedIndex = Number((optionAnswer.option as Extract<JevAnswer, { type: "choice" }>).choice.slice(1));
             const opt = opts[pickedIndex];
-            await page.selectOption(selectorFor(element), { index: opt.i }, { timeout: bounded(4_000) });
+            await target.selectOption(selectorFor(element), { index: opt.i }, { timeout: bounded(4_000) });
             detail = `selected "${opt.label}"`;
           }
         } else if (chosen.startsWith("fill_password_")) {
@@ -1363,7 +1481,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
             // announced with input/change events, matching fill() semantics
             // for framework-controlled inputs.
             credentialUsed = true; // even a failed attempt suppresses the screenshot
-            const handle = page.locator(selectorFor(element));
+            const handle = target.locator(selectorFor(element));
             const fill = await handle
               .evaluate((el, args) => {
                 const input = el;
@@ -1394,9 +1512,9 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
             }
           }
         } else if (element.menu === "closed") {
-          detail = `${await openMenu(page, selectorFor(element), bounded)}: ${element.description}`;
+          detail = `${await openMenu(target, selectorFor(element), bounded)}: ${element.description}`;
         } else {
-          await page.click(selectorFor(element), { timeout: bounded(4_000) });
+          await target.click(selectorFor(element), { timeout: bounded(4_000) });
           detail = element.description;
         }
       } catch (error) {
@@ -1427,6 +1545,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
         after.title === observables.title &&
         Math.abs(after.textLength - observables.textLength) <= 50 &&
         Math.abs(after.scrollY - observables.scrollY) <= 40 &&
+        after.frameText === observables.frameText &&
         !highlightMoved;
       const outcome = actionError
         ? "action failed"
@@ -1438,7 +1557,9 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
               ? "page content changed"
               : Math.abs(after.scrollY - observables.scrollY) > 40
                 ? "scrolled"
-                : highlightMoved
+                : after.frameText !== observables.frameText
+                  ? "content inside a frame changed"
+                  : highlightMoved
                   ? `highlighted "${focusedAfter.activeItem}"`
                   : typedIntoLabel !== null
                   ? // A fill is a real effect even when nothing navigates: the

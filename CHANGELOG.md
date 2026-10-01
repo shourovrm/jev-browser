@@ -2,6 +2,7 @@
 
 ## Unreleased (local)
 
+- Iframes: controls in visible same- and cross-origin frames are offered (main frame first), acted on in their own frame, and labelled with the frame's host when it is another origin; frame text is judged and frame changes count as effects; the password fill checks the frame's own origin.
 - Helium launches are warmed up (wait for its built-in uBlock Origin, one throwaway page load, 6 s after launch) because uBO holds or drops click navigations in its first seconds; the MCP and HTTP servers keep one warmed browser open and give each run a fresh context. New library exports `keepBrowserOpen()` and `closeSharedBrowser()`.
 - Text fields are described with what they currently hold (`input "State" holding "Nevada"`), so Jev can see a finished fill or autocomplete pick; password fields are never read.
 - Keyboard inside menus: with focus in a menu, menubar, listbox or combobox, Jev can press Down, Up, Enter and Escape (Right and Left in a menubar); highlight moves count as an effect; the stuck watcher presses Escape once when a menu has focus.
