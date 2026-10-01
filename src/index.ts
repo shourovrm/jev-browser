@@ -19,7 +19,17 @@ import {
   validateSecretBuffer,
 } from "./password.js";
 
-if (process.argv[2] === "run") {
+if (process.argv[2] === "browser-daemon") {
+  const { runBrowserDaemon } = await import("./background-browser.js");
+  await runBrowserDaemon();
+  // Never fall through to the MCP server below; the daemon's idle shutdown,
+  // a signal or `stop-browser` ends the process with process.exit().
+  await new Promise(() => {});
+} else if (process.argv[2] === "stop-browser") {
+  const { stopBackgroundBrowser } = await import("./background-browser.js");
+  console.log((await stopBackgroundBrowser()) ? "stopped the background browser" : "no background browser was running");
+  process.exit(0);
+} else if (process.argv[2] === "run") {
   process.exit(await runCli(process.argv.slice(3)));
 }
 if (process.argv[2] === "--help" || process.argv[2] === "-h") {

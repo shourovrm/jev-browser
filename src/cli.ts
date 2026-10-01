@@ -4,6 +4,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { parseCookieSpec } from "./lib.js";
 import { navigate, type NavigateOptions } from "./navigate.js";
+import { connectToBackgroundBrowser } from "./background-browser.js";
 import { assertNoPlaywrightDebug, parseTrustedOrigin, readSecretFromPath, readSecretFromStdin, validateSecretBuffer } from "./password.js";
 
 interface CliArgs extends NavigateOptions {
@@ -13,6 +14,7 @@ interface CliArgs extends NavigateOptions {
   passwordFile?: string;
   passwordOrigin?: string;
   cookieFiles?: Array<{ name: string; path: string }>;
+  noBackgroundBrowser?: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -35,6 +37,9 @@ function parseArgs(argv: string[]): CliArgs {
         break;
       case "--no-typing":
         args.allowTyping = false;
+        break;
+      case "--no-background-browser":
+        args.noBackgroundBrowser = true;
         break;
       case "--screenshot":
         args.screenshotPath = argv[++i];
@@ -80,6 +85,9 @@ Options:
   --format <text|markdown|html|aria>   Final page payload (default text)
   --max-chars <n>                      Override the format's character cap
   --max-steps <n>                      Hard step cap (default 24)
+  --no-background-browser              Launch a browser for this run only
+                                       instead of using the warm background
+                                       browser (also JEV_BROWSER_BACKGROUND=0)
   --max-seconds <n>                    Wall-clock cap (default 180)
   --no-typing                          Disable typing into fields
   --screenshot <path>                  Write the final JPEG to this path
@@ -164,7 +172,14 @@ export async function runCli(argv: string[]): Promise<number> {
     }
   }
 
-  const { screenshotPath, recordPath, passwordFile, passwordOrigin, cookieFiles, ...navigateArgs } = args;
+  const { screenshotPath, recordPath, passwordFile, passwordOrigin, cookieFiles, noBackgroundBrowser, ...navigateArgs } = args;
+  // The warm background browser makes runs start in well under a second
+  // instead of paying a launch and Helium's 6 s warm-up. Credential runs and
+  // recordings keep a browser of their own: secrets never enter a long-lived
+  // process, and remote browsers cannot hand back a local video path.
+  const useBackgroundBrowser =
+    !noBackgroundBrowser && process.env.JEV_BROWSER_BACKGROUND !== "0" && !recordPath && !password && !navigateArgs.cookies?.length;
+  const backgroundBrowser = useBackgroundBrowser ? await connectToBackgroundBrowser() : null;
   let recordDir: string | undefined;
   let tempRecordDir: string | undefined;
   if (recordPath) {
@@ -187,6 +202,7 @@ export async function runCli(argv: string[]): Promise<number> {
         screenshot: screenshotPath ? "final" : (args.screenshot ?? "final"),
         recordDir,
         password,
+        browser: backgroundBrowser ?? undefined,
       })) as Record<string, any>;
     } catch (error) {
       // Configuration refusals (typing provider, credential guards) surface as
@@ -230,6 +246,7 @@ export async function runCli(argv: string[]): Promise<number> {
     console.log(JSON.stringify(result, null, 2));
     return result.status === "error" ? 1 : 0;
   } finally {
+    await backgroundBrowser?.close().catch(() => {}); // disconnects; the background browser keeps running
     if (tempRecordDir) {
       const fs = await import("node:fs/promises");
       await fs.rm(tempRecordDir, { recursive: true, force: true }).catch(() => {});

@@ -54,6 +54,12 @@ export interface NavigateOptions {
   startUrl?: string;
   /** Reuse an existing Playwright page instead of launching a new browser. */
   page?: Page;
+  /**
+   * Run in this already-launched (or connected) browser instead of launching
+   * one: the run creates its own context and closes only that context. The
+   * CLI passes its warm background browser here.
+   */
+  browser?: Browser;
   /** Override judgment transport for this run, independent of JEV_PROVIDER and credentials. */
   transport?: JevTransport;
   maxSteps?: number;
@@ -809,11 +815,19 @@ const CONTENT_BLOCKER_WARM_UP_MS = 6_000;
  */
 async function launchWarmBrowser(): Promise<Browser> {
   const launchedAt = performance.now();
-  const browser = await chromium.launch({
-    headless: process.env.JEV_BROWSER_HEADED !== "1",
-    executablePath: resolveBrowserExecutable(process.env, existsSync),
-  });
-  if (!(await waitForContentBlocker(browser, 8_000))) return browser;
+  const browser = await chromium.launch(browserLaunchOptions());
+  await warmUpBrowser(browser, launchedAt);
+  return browser;
+}
+
+/** The launch settings every jev-browser browser uses, per-run, shared or background. */
+export function browserLaunchOptions(env: NodeJS.ProcessEnv = process.env): { headless: boolean; executablePath: string | undefined } {
+  return { headless: env.JEV_BROWSER_HEADED !== "1", executablePath: resolveBrowserExecutable(env, existsSync) };
+}
+
+/** The uBO warm-up of launchWarmBrowser(), for a browser launched elsewhere; launchedAt is a performance.now() value. */
+export async function warmUpBrowser(browser: Browser, launchedAt: number): Promise<void> {
+  if (!(await waitForContentBlocker(browser, 8_000))) return;
   const warmUpServer = createServer((_request, response) => {
     response.setHeader("Content-Type", "text/html");
     response.end("<!doctype html><title>warm-up</title><a href='/'>warm-up</a>");
@@ -830,7 +844,6 @@ async function launchWarmBrowser(): Promise<Browser> {
     warmUpServer.closeAllConnections();
     warmUpServer.close();
   }
-  return browser;
 }
 
 // One warmed browser per process when keepBrowserOpen() was called: the MCP
@@ -950,6 +963,9 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
   // leak the deadline timer or the caller's abort listener either.
   if (options.page && options.recordDir) {
     throw new Error("navigate(): video recording is refused on runs with an injected page");
+  }
+  if (options.page && options.browser) {
+    throw new Error("navigate(): pass either page or browser, not both");
   }
   if (!options.page && !startUrl) {
     throw new Error("startUrl is required when page is not supplied");
@@ -1131,8 +1147,11 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
 
   try {
     ownsBrowser = !options.page;
-    usesSharedBrowser = ownsBrowser && sharedBrowserEnabled;
-    if (ownsBrowser) browser = usesSharedBrowser ? await acquireSharedBrowser() : await launchWarmBrowser();
+    // A caller's browser and the process-wide shared one are both kept open:
+    // the run only closes the context it creates.
+    usesSharedBrowser = ownsBrowser && (Boolean(options.browser) || sharedBrowserEnabled);
+    if (options.browser) browser = options.browser;
+    else if (ownsBrowser) browser = usesSharedBrowser ? await acquireSharedBrowser() : await launchWarmBrowser();
     if (!options.page) {
       runContext = await browser!.newContext({
         viewport: { width: 1024, height: 640 },

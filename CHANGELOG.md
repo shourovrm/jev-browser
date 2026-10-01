@@ -2,6 +2,7 @@
 
 ## Unreleased (local)
 
+- CLI background browser: `jev-browser run` connects to a warm background Helium started on first use (loopback, unguessable endpoint, state file mode 600), so runs start in about 0.4 s instead of about 7 s; it exits after 15 idle minutes, `jev-browser stop-browser` stops it, and credential, cookie and recording runs keep a browser of their own. `navigate()` takes a `browser` option. The agent skill now uses the CLI by default.
 - Menu key actions follow keyboard focus into iframes.
 - Iframes: controls in visible same- and cross-origin frames are offered (main frame first), acted on in their own frame, and labelled with the frame's host when it is another origin; frame text is judged and frame changes count as effects; the password fill checks the frame's own origin.
 - Helium launches are warmed up (wait for its built-in uBlock Origin, one throwaway page load, 6 s after launch) because uBO holds or drops click navigations in its first seconds; the MCP and HTTP servers keep one warmed browser open and give each run a fresh context. New library exports `keepBrowserOpen()` and `closeSharedBrowser()`.
