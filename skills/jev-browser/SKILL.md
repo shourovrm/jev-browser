@@ -1,11 +1,6 @@
 ---
 name: jev-browser
 description: Conventions for jev-browser, the Jev-driven browser agent (the `jev-browser run` CLI, or the jev_navigate MCP tool). Use when a task needs a real website driven to a goal — forms, logins behind a seeded cookie, multi-step JS flows — or needs an evidence-grade record of the browsing. Also use when choosing between jev-browser, a static fetch, and your client's own browser automation.
-mcpServers:
-  jev-browser:
-    command: npx
-    args: ["-y", "@jkudish/jev-browser"]
-    includeTools: ["jev_navigate"]
 ---
 
 # Jev Browser

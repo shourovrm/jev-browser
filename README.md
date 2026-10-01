@@ -139,7 +139,7 @@ The server itself speaks plain HTTP: terminate TLS at a reverse proxy or load ba
 
 ### Agent skill
 
-The package ships an agent skill (`skills/jev-browser/`) that teaches coding agents when to call `jev_navigate` instead of a static fetch, how to read budgets, statuses, and the judgment trace, and how logins work without leaking secrets. Copy it into your client's skills directory:
+The package ships an agent skill (`skills/jev-browser/`) that teaches coding agents to run `jev-browser run` from the shell (or call `jev_navigate` without one) instead of a static fetch, how to read budgets, statuses, and the judgment trace, and how logins work without leaking secrets. Copy it into your client's skills directory:
 
 ```bash
 npm pack @jkudish/jev-browser@latest
@@ -147,7 +147,7 @@ tar -xzf jkudish-jev-browser-*.tgz
 mkdir -p .claude/skills && cp -R package/skills/jev-browser .claude/skills/
 ```
 
-Claude Code reads `.claude/skills`, OpenCode `.opencode/skills`, and Codex and generic agents `.agents/skills`. In Amp, the skill's frontmatter bundles the MCP server, so dropping it into a skills directory wires up both.
+Claude Code reads `.claude/skills`, OpenCode `.opencode/skills`, and Codex and generic agents `.agents/skills`. The skill does not register an MCP server: agents with a shell use the CLI, and a client that needs the `jev_navigate` tool registers the server as shown under [Install](#install).
 
 ## Without MCP: CLI and library
 
