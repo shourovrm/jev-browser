@@ -708,8 +708,20 @@ async function openMenu(page: Page | Frame, selector: string, bounded: (cap: num
  * flat tree, so the focused item may be slotted into a component's menu.
  */
 async function focusedMenu(page: Page, textCap: number): Promise<FocusedMenu | null> {
-  return page
-    .evaluate((cap) => {
+  // Keyboard focus can sit inside an iframe: the main document then reports
+  // the <iframe> element as active. Child frames only count while they hold
+  // focus, so a menu left focused in a frame that lost focus is ignored.
+  for (const frame of page.frames()) {
+    const focused = await focusedMenuInFrame(frame, textCap, frame !== page.mainFrame());
+    if (focused) return focused;
+  }
+  return null;
+}
+
+async function focusedMenuInFrame(frame: Frame, textCap: number, requireFrameFocus: boolean): Promise<FocusedMenu | null> {
+  return frame
+    .evaluate(({ cap, requireFrameFocus }) => {
+      if (requireFrameFocus && !document.hasFocus()) return null;
       const clean = (s: string | null | undefined) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, cap);
       let focused: Element | null = document.activeElement;
       while (focused?.shadowRoot?.activeElement) focused = focused.shadowRoot.activeElement;
@@ -730,7 +742,7 @@ async function focusedMenu(page: Page, textCap: number): Promise<FocusedMenu | n
         label: clean(container.getAttribute("aria-label") || lookUp(container.getAttribute("aria-labelledby"))),
         activeItem: clean(activeItem?.textContent),
       };
-    }, textCap)
+    }, { cap: textCap, requireFrameFocus })
     .catch(() => null);
 }
 

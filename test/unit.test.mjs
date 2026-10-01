@@ -595,6 +595,15 @@ test("text inside a visible frame is judged, and a change inside it counts as an
   assert.match(statesPerStep[1].page_text_excerpt, /Frame: Thank you, your order number is 4417/);
 });
 
+test("a menubar inside an iframe gets the same key actions once focus is in it", async (t) => {
+  const pageHtml = `<!doctype html><title>Cafe</title><p>Navigation below</p>
+    <iframe src="/nav" style="width: 500px; height: 220px"></iframe>`;
+  const { statesPerStep, result } = await runMenuScenario(t, pageHtml, ["Home", "Right arrow", "Press Enter"], { "/nav": htmlPage(keyboardMenubar) });
+  assert.deepEqual(result.steps.slice(0, 3).map((step) => step.executed_action.replace(/_e\d+$/, "")), ["click", "press_right", "press_enter"]);
+  assert.equal(result.steps[1].outcome, 'highlighted "About"');
+  assert.match(statesPerStep[3].page_text_excerpt, /Frame: .*Opened the About page/);
+});
+
 test("controls in hidden, tiny and blank iframes are not offered", async (t) => {
   const pageHtml = `<!doctype html><title>Cafe</title><a href="/about">About us</a>
     <iframe src="/tracker" style="display: none"></iframe>
