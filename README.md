@@ -8,6 +8,16 @@ Fast and very cheap browser use using TypeSafe's Jev model.
 
 ## Setup for coding agents
 
+Pasting the prompt below into Claude Code, Codex, OpenCode or any other coding agent makes the agent install jev-browser by following the steps in this section.
+
+```text
+Set up jev-browser on this machine. Clone https://github.com/shourovrm/jev-browser.git to ~/repos/jev-browser, then read the "Setup for coding agents" section of its README.md and follow every step in it, in order.
+Ask me before you download a browser.
+Never print, echo, log or commit my OpenRouter API key, and never ask me to paste it into this chat. I will put it into ~/.config/jev/openrouter.env myself, so tell me when that file is ready for me to edit.
+If any step fails, stop and report the failing command and its output instead of working around it.
+When all steps are done, report the results of both verification commands (the jev-browser run check and the jev-router try check), and tell me how to switch the router on for a session.
+```
+
 A coding agent can install everything in this section without help, except the API key, which the user supplies. The steps install jev-browser, its CLI and MCP wrappers, the Jev router (a `UserPromptSubmit` hook that sizes each Claude Code prompt and suggests a helper agent and a skill), the `jev-browser` and `use-jev` skills, and the four helper agents the router hands work to.
 
 **Requirements.** The machine needs Linux or macOS, Node.js 22 or newer, `git`, `python3`, `jq` and `curl`. The browser is Helium at `/usr/bin/helium-browser` when it is installed; without it, jev-browser uses Playwright's Chromium, which `npx playwright install chromium` downloads (ask the user before downloading a browser). Jev calls go through OpenRouter, so the user needs an OpenRouter API key with access to `typesafe/jev-1.13`.
