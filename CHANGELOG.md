@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (local)
+## 0.9.0 (2026-10-02)
 
 - The agent skill no longer bundles an MCP server in its frontmatter; it pointed at the published npm package and could start a second `jev-browser` server next to a locally configured one.
 - CLI background browser: `jev-browser run` connects to a warm background Helium started on first use (loopback, unguessable endpoint, state file mode 600), so runs start in about 0.4 s instead of about 7 s; it exits after 15 idle minutes, `jev-browser stop-browser` stops it, and credential, cookie and recording runs keep a browser of their own. `navigate()` takes a `browser` option. The agent skill now uses the CLI by default.
