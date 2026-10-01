@@ -4,10 +4,6 @@
 
 This repository is a fork of [jkudish/jev-browser](https://github.com/jkudish/jev-browser) 0.8.1. It adds ARIA menu, option and tab controls, shadow DOM, arrow-key menus, iframes, a warm background browser for the CLI, and a Claude Code setup made of the Jev router, two skills and four helper agents. [ROADMAP.md](ROADMAP.md) describes each addition with its live-check results, and [CHANGELOG.md](CHANGELOG.md) lists them under "Unreleased (local)".
 
-<p align="center">
-  <img src=".github/jev-browser-banner.png" alt="jev-browser — Fast and cheap browser use using TypeSafe's Jev model" />
-</p>
-
 Fast and very cheap browser use using TypeSafe's Jev model.
 
 ## Setup for coding agents
