@@ -58,6 +58,7 @@ A coding agent can install everything in this section without help, except the A
 | `~/.local/bin/jev-router` | The router: `hook`, `on`, `off`, `status`, `try` and `skills` subcommands |
 | `~/.local/bin/jev` | Sends one Jev decisions request (`jev request.json`); the `use-jev` skill uses it |
 | `~/.claude/skills/jev-browser`, `~/.claude/skills/use-jev` | Symlinks into this repository, so `git pull` updates them |
+| `~/.pi/agent/skills/jev-browser`, `~/.pi/agent/skills/use-jev` | The same symlinks for the [pi coding agent](https://github.com/earendil-works/pi), added only when `~/.pi/agent` exists; pi gets the skills and uses the CLI through its shell, while the router hook and helper agents are Claude Code only |
 | `~/.claude/agents/jev-tiny.md` and `jev-everyday`, `jev-large`, `jev-hardest` | Helper agents on Haiku, Sonnet, Opus and Opus |
 | `~/.config/jev/builtin-skills.json` | Descriptions of Claude Code's bundled skills, so the router can pick them |
 | `~/.claude/settings.json` | One `UserPromptSubmit` hook entry for `jev-router hook`, added once; a timestamped backup is saved first |

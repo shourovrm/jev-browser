@@ -2,6 +2,7 @@
 # Installs jev-browser's Claude Code setup for the current user:
 #   ~/.local/bin        jev-browser, jev-browser-mcp, jev, jev-router
 #   ~/.claude/skills    jev-browser and use-jev (symlinks into this repo)
+#   ~/.pi/agent/skills  the same two skills, when the pi coding agent is installed
 #   ~/.claude/agents    jev-tiny, jev-everyday, jev-large, jev-hardest
 #   ~/.config/jev       builtin-skills.json, and openrouter.env (key placeholder, mode 600)
 #   ~/.claude/settings.json   the jev-router UserPromptSubmit hook
@@ -42,8 +43,8 @@ echo "installed commands in $bin_dir"
 # Skills are linked, so pulling this repo updates them. A real directory of
 # the same name belongs to someone else and is left alone.
 link_skill() {
-    local source_dir="$1" name="$2"
-    local target="$skills_dir/$name"
+    local source_dir="$1" name="$2" into_dir="${3:-$skills_dir}"
+    local target="$into_dir/$name"
     if [[ -e "$target" && ! -L "$target" ]]; then
         echo "skipped skill $name: $target exists and is not a symlink"
         return
@@ -53,6 +54,16 @@ link_skill() {
 }
 link_skill "$repo_dir/skills/jev-browser" jev-browser
 link_skill "$setup_dir/skills/use-jev" use-jev
+
+# pi reads the same SKILL.md format from ~/.pi/agent/skills, and its bash runs
+# jev-browser and jev from ~/.local/bin. The router hook and the helper agents
+# are Claude Code features, so pi gets the skills only.
+pi_skills_dir="$HOME/.pi/agent/skills"
+if [[ -d "$HOME/.pi/agent" ]]; then
+    mkdir -p "$pi_skills_dir"
+    link_skill "$repo_dir/skills/jev-browser" jev-browser "$pi_skills_dir"
+    link_skill "$setup_dir/skills/use-jev" use-jev "$pi_skills_dir"
+fi
 
 install -m 644 "$setup_dir"/agents/jev-*.md "$agents_dir/"
 echo "installed agents jev-tiny, jev-everyday, jev-large, jev-hardest"
