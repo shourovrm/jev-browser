@@ -33,7 +33,7 @@ Full-resolution video: [assets/github-demo.mp4](assets/github-demo.mp4).
 
 ## Install
 
-Requires Node.js 22 or newer, an API key for a Jev transport ([TypeSafe direct](https://console.typesafe.ai/settings/keys) is the default; alternatives are listed under [Configuration](#configuration)), and optionally a key for a typing provider (see [the typing model](#the-typing-model)). Nothing is downloaded on install. The browser is `JEV_BROWSER_EXECUTABLE_PATH` when set, otherwise Helium at `/usr/bin/helium-browser` when installed, otherwise Playwright's own Chromium (install it yourself with `npx playwright install chromium`).
+Requires Node.js 22 or newer, an API key for a Jev transport ([TypeSafe direct](https://console.typesafe.ai/settings/keys) is the default; alternatives are listed under [Configuration](#configuration)), and optionally a key for a typing provider (see [the typing model](#the-typing-model)). Nothing is downloaded on install. The browser is `JEV_BROWSER_EXECUTABLE_PATH` when set, otherwise Helium at `/usr/bin/helium-browser` when installed, otherwise Playwright's own Chromium (install it yourself with `npx playwright install chromium`). Helium ships uBlock Origin built in, and for its first seconds after a launch uBO holds or drops click navigations, so a Helium launch is warmed up: jev-browser waits for uBO, loads one throwaway local page, and starts acting 6 s after launch. The MCP and HTTP servers launch and warm up one browser at startup and give every run its own fresh context, so only CLI runs and direct `navigate()` calls pay the 6 s. Library users with a long-lived process can do the same with `keepBrowserOpen()` and must call `closeSharedBrowser()` before exiting.
 
 ### Let an agent install it for you
 

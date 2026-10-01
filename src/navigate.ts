@@ -10,6 +10,8 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { existsSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import TurndownService from "turndown";
 import * as gfm from "turndown-plugin-gfm";
 import {
@@ -624,6 +626,133 @@ async function focusedMenu(page: Page, textCap: number): Promise<FocusedMenu | n
     .catch(() => null);
 }
 
+/**
+ * Helium ships uBlock Origin built in. In a freshly launched browser uBO
+ * spends about 4.5 s loading its filter lists; navigations started in that
+ * window are held and the tab is reloaded once uBO is ready, so an early
+ * click's navigation is delayed, repeated or lost. Wait, bounded, until uBO
+ * reports ready. Returns whether uBO is present; at once when it is not.
+ *
+ * uBO's page is an extension background page that Playwright does not
+ * expose, so it is reached over the browser's CDP session; the target
+ * message calls are the protocol's way to talk to a non-flattened target.
+ */
+async function waitForContentBlocker(browser: Browser, timeoutMs: number): Promise<boolean> {
+  const cdp = await browser.newBrowserCDPSession();
+  try {
+    const { targetInfos } = await cdp.send("Target.getTargets");
+    const ublock = targetInfos.find((target) => target.type === "background_page" && target.title === "uBlock Origin");
+    if (!ublock) return false;
+    const { sessionId } = await cdp.send("Target.attachToTarget", { targetId: ublock.targetId, flatten: false });
+    const replies = new Map<number, (value: unknown) => void>();
+    cdp.on("Target.receivedMessageFromTarget", (event) => {
+      const message = JSON.parse(event.message);
+      replies.get(message.id)?.(message.result?.result?.value);
+      replies.delete(message.id);
+    });
+    let nextMessageId = 1;
+    const isReady = () =>
+      new Promise<unknown>((resolve) => {
+        const id = nextMessageId++;
+        replies.set(id, resolve);
+        const message = { id, method: "Runtime.evaluate", params: { expression: "self.µBlock?.readyToFilter === true", returnByValue: true } };
+        cdp.send("Target.sendMessageToTarget", { sessionId, message: JSON.stringify(message) }).catch(() => resolve(false));
+      });
+    const deadline = performance.now() + timeoutMs;
+    while (performance.now() < deadline) {
+      // A reply that never comes must not outlast the deadline.
+      const ready = await Promise.race([isReady(), new Promise((resolve) => setTimeout(() => resolve(false), 500))]);
+      if (ready === true) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return true;
+  } catch {
+    // Waiting is an optimisation for one browser; never fail a run over it.
+    return false;
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
+// uBO's startup is not over when it reports ready: a click within about
+// 2.7 s of the browser's first real page load is still held. Measured on
+// Helium 0.18 (Chromium 154): with a warm-up page load and 6 s since launch,
+// clicks in fresh contexts reach the server in about 90 ms; with 4 s, the
+// first one was still held for 1.3 s.
+const CONTENT_BLOCKER_WARM_UP_MS = 6_000;
+
+/**
+ * Launches the browser and, when it carries uBlock Origin, warms it up: waits
+ * for uBO, loads one throwaway page served from loopback, and returns once
+ * CONTENT_BLOCKER_WARM_UP_MS have passed since launch. Without uBO it returns
+ * right after launch.
+ */
+async function launchWarmBrowser(): Promise<Browser> {
+  const launchedAt = performance.now();
+  const browser = await chromium.launch({
+    headless: process.env.JEV_BROWSER_HEADED !== "1",
+    executablePath: resolveBrowserExecutable(process.env, existsSync),
+  });
+  if (!(await waitForContentBlocker(browser, 8_000))) return browser;
+  const warmUpServer = createServer((_request, response) => {
+    response.setHeader("Content-Type", "text/html");
+    response.end("<!doctype html><title>warm-up</title><a href='/'>warm-up</a>");
+  });
+  try {
+    await new Promise<void>((resolve) => warmUpServer.listen(0, "127.0.0.1", resolve));
+    const { port } = warmUpServer.address() as AddressInfo;
+    const warmUpContext = await browser.newContext();
+    await (await warmUpContext.newPage()).goto(`http://127.0.0.1:${port}/`, { timeout: 8_000 }).catch(() => {});
+    const remainingMs = CONTENT_BLOCKER_WARM_UP_MS - (performance.now() - launchedAt);
+    if (remainingMs > 0) await new Promise((resolve) => setTimeout(resolve, remainingMs));
+    await warmUpContext.close();
+  } finally {
+    warmUpServer.closeAllConnections();
+    warmUpServer.close();
+  }
+  return browser;
+}
+
+// One warmed browser per process when keepBrowserOpen() was called: the MCP
+// and HTTP servers pay the launch and warm-up once, and every run still gets
+// its own fresh context (no cookies or storage shared between runs).
+let sharedBrowserEnabled = false;
+let sharedBrowser: Promise<Browser> | null = null;
+
+/**
+ * Reuse one browser for every run in this process instead of launching one
+ * per run, and start launching it now. For long-lived processes only: an
+ * open browser keeps Node running, so call closeSharedBrowser() to exit.
+ */
+export function keepBrowserOpen(): void {
+  sharedBrowserEnabled = true;
+  acquireSharedBrowser().catch(() => {}); // a failed launch is retried by the next run
+}
+
+export async function closeSharedBrowser(): Promise<void> {
+  const browser = sharedBrowser;
+  sharedBrowserEnabled = false;
+  sharedBrowser = null;
+  await (await browser?.catch(() => null))?.close().catch(() => {});
+}
+
+function acquireSharedBrowser(): Promise<Browser> {
+  if (!sharedBrowser) {
+    const launching = launchWarmBrowser();
+    sharedBrowser = launching;
+    launching.then(
+      // A crashed or closed browser is relaunched by the next run.
+      (browser) => browser.on("disconnected", () => {
+        if (sharedBrowser === launching) sharedBrowser = null;
+      }),
+      () => {
+        if (sharedBrowser === launching) sharedBrowser = null;
+      },
+    );
+  }
+  return sharedBrowser;
+}
+
 // Some sites (nsf.gov among them) first serve a blank, untitled page that runs a script
 // and then reloads into the real one. Reading elements during that blank phase offers
 // Jev nothing but scroll/back/done, and settle() would call the empty DOM "stable".
@@ -835,6 +964,8 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
 
   let browser: Browser | null = null;
   let ownsBrowser = false;
+  let usesSharedBrowser = false;
+  let runContext: BrowserContext | null = null; // the context this run created, closed when it ends
   let observedContext: BrowserContext | null = null;
   let onNewPage: ((page: Page) => void) | null = null;
   const observerCleanups: Array<() => void> = [];
@@ -875,16 +1006,15 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
 
   try {
     ownsBrowser = !options.page;
-    browser = options.page ? null : await chromium.launch({
-      headless: process.env.JEV_BROWSER_HEADED !== "1",
-      executablePath: resolveBrowserExecutable(process.env, existsSync),
-    });
-    const context: BrowserContext = options.page
-      ? options.page.context()
-      : await browser!.newContext({
-          viewport: { width: 1024, height: 640 },
-          ...(options.recordDir ? { recordVideo: { dir: options.recordDir } } : {}),
-        });
+    usesSharedBrowser = ownsBrowser && sharedBrowserEnabled;
+    if (ownsBrowser) browser = usesSharedBrowser ? await acquireSharedBrowser() : await launchWarmBrowser();
+    if (!options.page) {
+      runContext = await browser!.newContext({
+        viewport: { width: 1024, height: 640 },
+        ...(options.recordDir ? { recordVideo: { dir: options.recordDir } } : {}),
+      });
+    }
+    const context: BrowserContext = options.page ? options.page.context() : runContext!;
     observedContext = context;
     // Seeded before the first navigation (the guards already ran pre-timer;
     // cookies + injected page and cookies + recording were both refused, so
@@ -1390,7 +1520,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
       }
     }
 
-    if (ownsBrowser) await browser?.close().catch(() => {});
+    if (ownsBrowser) await releaseBrowser(browser, runContext, usesSharedBrowser);
     const videoPath = (await videoPathPromise?.catch(() => undefined)) ?? null;
     const result = {
       status,
@@ -1449,8 +1579,18 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
     externalSignal?.removeEventListener("abort", onExternalAbort);
     if (observedContext && onNewPage) observedContext.off("page", onNewPage);
     for (const cleanup of observerCleanups.splice(0).reverse()) cleanup();
-    if (ownsBrowser) await browser?.close().catch(() => {});
+    if (ownsBrowser) await releaseBrowser(browser, runContext, usesSharedBrowser);
   }
+}
+
+/**
+ * Ends a run's hold on the browser it created: a shared browser only loses
+ * the run's context (closing it also finishes any video), a per-run browser
+ * is closed. Safe to call twice.
+ */
+async function releaseBrowser(browser: Browser | null, runContext: BrowserContext | null, shared: boolean): Promise<void> {
+  if (shared) await runContext?.close().catch(() => {});
+  else await browser?.close().catch(() => {});
 }
 
 async function extractPayload(

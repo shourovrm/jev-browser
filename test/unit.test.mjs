@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { existsSync } from "node:fs";
 import { chromium } from "playwright";
 import {
@@ -17,7 +17,12 @@ import {
   resolveCookies,
   HELIUM_EXECUTABLE_PATH,
 } from "../dist/lib.js";
-import { navigate } from "../dist/navigate.js";
+import { closeSharedBrowser, keepBrowserOpen, navigate } from "../dist/navigate.js";
+
+// One warmed browser for the whole file, the way the servers run: a fresh
+// launch per test would pay Helium's uBlock Origin warm-up every time.
+keepBrowserOpen();
+after(closeSharedBrowser);
 import { OPENROUTER_PRIVACY_FILTER, resolvePrivateTransport } from "../dist/provider.js";
 
 test("resolvePrivateTransport: OpenRouter Jev calls carry the no-training, zero-retention filter", async (t) => {
@@ -493,6 +498,47 @@ test("the scan reads the current value of inputs and textareas, never of passwor
   assert.ok(offeredPerStep[0].includes('input "State" holding "Nevada" (type without submitting)'));
   assert.ok(offeredPerStep[0].includes('textarea "Notes" holding "Leave at the door" (type without submitting)'));
   assert.ok(!offeredPerStep[0].some((description) => description.includes("hunter22")));
+});
+
+test("a link clicked at the first step of a fresh browser navigates at once, and exactly once", async (t) => {
+  // Helium's built-in uBlock Origin holds navigations for its first seconds,
+  // then reloads the tab: an early click was delayed, repeated or lost.
+  const http = await import("node:http");
+  const requests = [];
+  let nextArrivedAt = null;
+  const server = http.createServer((request, response) => {
+    requests.push(request.url);
+    if (request.url === "/next") nextArrivedAt ??= performance.now();
+    response.setHeader("Content-Type", "text/html");
+    response.end(request.url === "/next" ? "<title>Next</title><p>Arrived</p>" : "<title>Start</title><a href='/next'>Next page</a>");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.closeAllConnections?.() ?? server.close());
+  let calls = 0;
+  const transport = {
+    name: "fixture",
+    async ask({ questions }) {
+      calls++;
+      const answers = {};
+      for (const [id, question] of Object.entries(questions)) {
+        if (question.type === "noul") {
+          answers[id] = { type: "noul", noul: 0 };
+          continue;
+        }
+        const keys = Object.keys(question.criteria);
+        const pick = calls === 1 ? keys.find((key) => question.criteria[key].includes("Next page")) : "done";
+        answers[id] = { type: "choice", choice: pick, confidence: 1, probabilities: Object.fromEntries(keys.map((key) => [key, key === pick ? 1 : 0])) };
+      }
+      return { answers, usage: { input_tokens: 1, output_tokens: 1 }, model: "fixture" };
+    },
+  };
+  const runStartedAt = performance.now();
+  const result = await navigate({ task: "Open the next page", startUrl: `http://127.0.0.1:${server.address().port}/`, transport, maxSteps: 2, screenshot: "none" });
+  const requestDelayMs = nextArrivedAt - (runStartedAt + result.steps[0].t_ms);
+  assert.ok(requestDelayMs < 1_000, `the click's request reached the server ${Math.round(requestDelayMs)} ms after the step began`);
+  assert.match(result.final_url, /\/next$/);
+  assert.equal(result.steps[0].outcome, `navigated to http://127.0.0.1:${server.address().port}/next`);
+  assert.equal(requests.filter((url) => url === "/next").length, 1);
 });
 
 test("resolvePrivateTransport: other providers are left as they are", () => {

@@ -2,6 +2,7 @@
 
 ## Unreleased (local)
 
+- Helium launches are warmed up (wait for its built-in uBlock Origin, one throwaway page load, 6 s after launch) because uBO holds or drops click navigations in its first seconds; the MCP and HTTP servers keep one warmed browser open and give each run a fresh context. New library exports `keepBrowserOpen()` and `closeSharedBrowser()`.
 - Text fields are described with what they currently hold (`input "State" holding "Nevada"`), so Jev can see a finished fill or autocomplete pick; password fields are never read.
 - Keyboard inside menus: with focus in a menu, menubar, listbox or combobox, Jev can press Down, Up, Enter and Escape (Right and Left in a menubar); highlight moves count as an effect; the stuck watcher presses Escape once when a menu has focus.
 - While a modal dialog is open (`aria-modal="true"` or a native modal `<dialog>`, shadow roots included), controls outside it are described as behind it, so Jev closes the dialog instead of retrying a click the dialog intercepts.

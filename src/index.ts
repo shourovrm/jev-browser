@@ -6,7 +6,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { createRequire } from "node:module";
-import { navigate } from "./navigate.js";
+import { keepBrowserOpen, navigate } from "./navigate.js";
 import { runCli } from "./cli.js";
 import type { SeedCookie } from "./lib.js";
 import {
@@ -248,6 +248,10 @@ server.registerTool(
   },
 );
 
+// Both server modes live long, so they launch and warm up one browser now and
+// reuse it: Helium's built-in uBlock Origin makes the first seconds after a
+// launch unreliable for clicks. Each run still gets its own fresh context.
+keepBrowserOpen();
 if (process.argv.includes("--http") || process.env.JEV_BROWSER_TRANSPORT === "http") {
   const { serveHttp } = await import("./http.js");
   const { url } = await serveHttp(createServer);
